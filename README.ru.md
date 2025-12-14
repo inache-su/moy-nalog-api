@@ -10,7 +10,7 @@
 
 Неофициальный Python-клиент для API "Мой налог" (самозанятые, режим НПД).
 
-[English version](README.md)
+[English version](https://github.com/inache-su/moy-nalog-api/blob/main/README.md)
 
 ## Почему moy-nalog-api?
 

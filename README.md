@@ -10,7 +10,7 @@
 
 Unofficial Python client for "Moy Nalog" API (self-employed, NPD tax regime).
 
-[Документация на русском](README.ru.md)
+[Документация на русском](https://github.com/inache-su/moy-nalog-api/blob/main/README.ru.md)
 
 ## Why moy-nalog-api?
 
