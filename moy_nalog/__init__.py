@@ -51,7 +51,7 @@ from .models import (
     UserProfile,
 )
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 __author__ = "Kirill Nikulin"
 __email__ = "me@kirodev.eu"
 
