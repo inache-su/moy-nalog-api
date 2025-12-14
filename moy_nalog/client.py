@@ -836,7 +836,7 @@ class MoyNalogClientSync:
     ) -> None:
         self.close()
 
-    # Proxy methods
+    # Proxy properties
     @property
     def is_authenticated(self) -> bool:
         return self._client.is_authenticated
@@ -844,6 +844,32 @@ class MoyNalogClientSync:
     @property
     def inn(self) -> str | None:
         return self._client.inn
+
+    @property
+    def access_token(self) -> str | None:
+        return self._client.access_token
+
+    @property
+    def refresh_token(self) -> str | None:
+        return self._client.refresh_token
+
+    @property
+    def token_expires_at(self) -> datetime | None:
+        return self._client.token_expires_at
+
+    @property
+    def is_token_expired(self) -> bool:
+        return self._client.is_token_expired
+
+    # Proxy methods
+    def set_tokens(
+        self,
+        access_token: str,
+        refresh_token: str | None = None,
+        inn: str | None = None,
+        expire_at: datetime | None = None,
+    ) -> None:
+        self._client.set_tokens(access_token, refresh_token, inn, expire_at)
 
     def auth_by_password(self, username: str, password: str) -> UserProfile:
         return self._run(self._client.auth_by_password(username, password))
@@ -865,6 +891,9 @@ class MoyNalogClientSync:
 
     def get_receipt(self, receipt_uuid: str) -> dict[str, Any] | None:
         return self._run(self._client.get_receipt(receipt_uuid))
+
+    def get_receipt_print_url(self, receipt_uuid: str) -> str:
+        return self._client.get_receipt_print_url(receipt_uuid)
 
     def get_incomes(self, **kwargs: Any) -> IncomeList:
         return self._run(self._client.get_incomes(**kwargs))
