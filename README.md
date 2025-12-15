@@ -29,6 +29,7 @@ There are several Python libraries for the Moy Nalog API. Here's why you should 
 | **Error handling** | Typed exception hierarchy | Generic exceptions |
 | **Retry logic** | Exponential backoff built-in | Usually none |
 | **Multiple items** | Native support for multi-item receipts | Single item only |
+| **Proxy support** | HTTP, HTTPS, SOCKS4/5 | Often none |
 | **Documentation** | Comprehensive with examples | Often minimal |
 
 ## Features
@@ -42,12 +43,18 @@ There are several Python libraries for the Moy Nalog API. Here's why you should 
 - All client types (individual, legal entity, foreign)
 - Income list with pagination and filtering
 - Receipt cancellation with reason
+- HTTP/HTTPS and SOCKS proxy support
 - Complete type hints for IDE support
 
 ## Installation
 
 ```bash
 pip install moy-nalog-api
+```
+
+For SOCKS proxy support:
+```bash
+pip install moy-nalog-api[socks]
 ```
 
 For development:
@@ -399,7 +406,54 @@ client = MoyNalogClient(
 
     # Auto-refresh tokens before expiration (default: True)
     auto_refresh_token=True,
+
+    # Proxy server URL (optional)
+    proxy="http://proxy.example.com:8080",
 )
+```
+
+## Proxy Support
+
+The client supports HTTP, HTTPS, and SOCKS proxies for all API requests.
+
+### HTTP/HTTPS Proxy
+
+```python
+# HTTP proxy (works out of the box)
+client = MoyNalogClient(proxy="http://proxy.example.com:8080")
+
+# With authentication
+client = MoyNalogClient(proxy="http://user:password@proxy.example.com:8080")
+
+# HTTPS proxy
+client = MoyNalogClient(proxy="https://proxy.example.com:8080")
+```
+
+### SOCKS Proxy
+
+SOCKS proxy support requires an additional dependency:
+
+```bash
+pip install moy-nalog-api[socks]
+```
+
+```python
+# SOCKS5 proxy
+client = MoyNalogClient(proxy="socks5://proxy.example.com:1080")
+
+# SOCKS5 with authentication
+client = MoyNalogClient(proxy="socks5://user:password@proxy.example.com:1080")
+
+# SOCKS4 proxy
+client = MoyNalogClient(proxy="socks4://proxy.example.com:1080")
+```
+
+### Sync Client
+
+The synchronous wrapper also supports proxies:
+
+```python
+client = MoyNalogClientSync(proxy="http://proxy.example.com:8080")
 ```
 
 ## User Profile

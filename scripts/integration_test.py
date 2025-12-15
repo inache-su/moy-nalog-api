@@ -508,7 +508,13 @@ class IntegrationTest:
         self.logger.info(f"\nCancelled {len(self.created_receipts)} receipts")
         return all_cancelled
 
-    async def test_session_persistence(self, username: str, password: str) -> bool:
+    async def test_session_persistence(
+        self,
+        username: str,
+        password: str,
+        proxy: str | None = None,
+        verify_ssl: bool = True,
+    ) -> bool:
         """Test session save/restore functionality."""
         self.logger.info("\n" + "-" * 40)
         self.logger.info("TEST: Session Persistence")
@@ -517,7 +523,9 @@ class IntegrationTest:
 
         try:
             # First client - authenticate and save session
-            async with MoyNalogClient(session_file=str(session_file)) as client1:
+            async with MoyNalogClient(
+                session_file=str(session_file), proxy=proxy, verify_ssl=verify_ssl
+            ) as client1:
                 await client1.auth_by_password(username, password)
                 inn1 = client1.inn
 
@@ -527,7 +535,9 @@ class IntegrationTest:
                 return False
 
             # Second client - should restore session
-            async with MoyNalogClient(session_file=str(session_file)) as client2:
+            async with MoyNalogClient(
+                session_file=str(session_file), proxy=proxy, verify_ssl=verify_ssl
+            ) as client2:
                 inn2 = client2.inn
                 is_auth = client2.is_authenticated
 
@@ -594,15 +604,35 @@ class IntegrationTest:
         username: str | None = None,
         password: str | None = None,
         phone: str | None = None,
+        proxy: str | None = None,
+        verify_ssl: bool = True,
+        test_mode: str = "auth_only",
     ) -> bool:
-        """Run all integration tests."""
+        """Run integration tests.
+
+        Args:
+            auth_method: "password" or "sms"
+            username: INN or phone for password auth
+            password: Password for password auth
+            phone: Phone number for SMS auth
+            proxy: Proxy URL (optional)
+            verify_ssl: Verify SSL certificates (default: True)
+            test_mode: "auth_only" or "full"
+        """
         self.logger.info("=" * 60)
         self.logger.info("MOY NALOG API - INTEGRATION TEST")
         self.logger.info(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        self.logger.info(f"Test mode: {test_mode.upper()}")
         self.logger.info(f"Auth method: {auth_method.upper()}")
+        if proxy:
+            # Hide password in proxy URL for logging
+            import re
+            safe_proxy = re.sub(r'://([^:]+):([^@]+)@', r'://\1:***@', proxy)
+            self.logger.info(f"Proxy: {safe_proxy}")
+            self.logger.info(f"SSL verify: {verify_ssl}")
         self.logger.info("=" * 60)
 
-        async with MoyNalogClient() as client:
+        async with MoyNalogClient(proxy=proxy, verify_ssl=verify_ssl) as client:
             # Authentication
             auth_success = False
             if auth_method == "password":
@@ -618,23 +648,28 @@ class IntegrationTest:
             # User profile
             await self.test_user_profile(client)
 
-            # Receipt creation tests
-            await self.test_simple_receipt(client)
-            await self.test_multi_item_receipt(client)
-            await self.test_receipt_with_individual_client(client)
-            await self.test_receipt_with_legal_entity(client)
-            await self.test_receipt_bank_transfer(client)
+            # Full test mode: receipts
+            if test_mode == "full":
+                # Receipt creation tests
+                await self.test_simple_receipt(client)
+                await self.test_multi_item_receipt(client)
+                await self.test_receipt_with_individual_client(client)
+                await self.test_receipt_with_legal_entity(client)
+                await self.test_receipt_bank_transfer(client)
 
-            # Query tests
-            await self.test_get_incomes(client)
-            await self.test_get_receipt_data(client)
+                # Query tests
+                await self.test_get_incomes(client)
+                await self.test_get_receipt_data(client)
 
-            # Cleanup - cancel all test receipts
-            await self.test_cancel_receipts(client)
+                # Cleanup - cancel all test receipts
+                await self.test_cancel_receipts(client)
+            else:
+                self.logger.info("\n" + "-" * 40)
+                self.logger.info("Skipping receipt tests (auth_only mode)")
 
         # Session persistence test (only for password auth)
         if auth_method == "password":
-            await self.test_session_persistence(username, password)
+            await self.test_session_persistence(username, password, proxy, verify_ssl)
 
         # Generate report
         self.generate_report()
@@ -643,13 +678,112 @@ class IntegrationTest:
         return all(t["success"] for t in self.test_results)
 
 
+def get_proxy_choice() -> tuple[str | None, bool]:
+    """Ask user if they want to use a proxy.
+
+    Returns:
+        Tuple of (proxy_url, verify_ssl)
+    """
+    print("\n" + "-" * 40)
+    print("Proxy Configuration")
+    print("-" * 40)
+
+    while True:
+        choice = input("Use proxy server? (y/n): ").strip().lower()
+        if choice in ("y", "yes"):
+            while True:
+                print("\nSupported proxy formats:")
+                print("  HTTP:   http://host:port")
+                print("  HTTPS:  https://host:port")
+                print("  SOCKS5: socks5://host:port")
+                print("  SOCKS4: socks4://host:port")
+                print("\nWith authentication:")
+                print("  http://user:password@host:port")
+                print("  socks5://user:password@host:port")
+                print("\nNote: SOCKS support requires: pip install moy-nalog-api[socks]")
+                print("-" * 40)
+
+                proxy_url = input("Proxy URL (or empty to skip): ").strip()
+
+                if not proxy_url:
+                    print("Continuing without proxy.")
+                    return None, True
+
+                # Basic validation
+                valid_prefixes = ("http://", "https://", "socks4://", "socks5://")
+                if not proxy_url.lower().startswith(valid_prefixes):
+                    print(f"\nWarning: Proxy URL should start with one of: {', '.join(valid_prefixes)}")
+                    print("  1. Try again")
+                    print("  2. Use this URL anyway")
+                    print("  3. Continue without proxy")
+
+                    while True:
+                        retry_choice = input("Enter 1, 2, or 3: ").strip()
+                        if retry_choice == "1":
+                            break  # Re-enter proxy URL
+                        elif retry_choice == "2":
+                            # Ask about SSL verification
+                            verify_ssl = get_ssl_verify_choice()
+                            return proxy_url, verify_ssl
+                        elif retry_choice == "3":
+                            print("Continuing without proxy.")
+                            return None, True
+                        else:
+                            print("Invalid choice. Please enter 1, 2, or 3.")
+                    continue  # Go back to proxy URL input
+
+                # Ask about SSL verification
+                verify_ssl = get_ssl_verify_choice()
+                return proxy_url, verify_ssl
+
+        elif choice in ("n", "no", ""):
+            return None, True
+        else:
+            print("Please enter 'y' or 'n'.")
+
+
+def get_ssl_verify_choice() -> bool:
+    """Ask user if they want to verify SSL certificates."""
+    print("\n" + "-" * 40)
+    print("Some proxy servers intercept SSL traffic and may cause")
+    print("certificate verification errors.")
+    print("-" * 40)
+
+    while True:
+        choice = input("Verify SSL certificates? (y/n) [default: y]: ").strip().lower()
+        if choice in ("y", "yes", ""):
+            return True
+        elif choice in ("n", "no"):
+            print("Warning: SSL verification disabled. Connection may be insecure.")
+            return False
+        else:
+            print("Please enter 'y' or 'n'.")
+
+
+def get_test_mode() -> str:
+    """Ask user which test mode to run."""
+    print("\n" + "-" * 40)
+    print("Test Mode")
+    print("-" * 40)
+    print("  1. Auth only - test authentication and profile")
+    print("  2. Full test - auth + create/cancel receipts")
+    print("-" * 40)
+
+    while True:
+        choice = input("Enter 1 or 2 [default: 1]: ").strip()
+        if choice == "" or choice == "1":
+            return "auth_only"
+        elif choice == "2":
+            return "full"
+        else:
+            print("Invalid choice. Please enter 1 or 2.")
+
+
 def get_auth_choice() -> dict:
     """Get authentication method and credentials from user."""
     print("\n" + "=" * 60)
     print("MOY NALOG API - INTEGRATION TEST")
     print("=" * 60)
-    print("\nThis script will test all API functionality.")
-    print("All created receipts will be CANCELLED at the end.")
     print("\n" + "-" * 40)
     print("Choose authentication method:")
     print("  1. Password (INN + password from nalog.ru)")
@@ -698,10 +832,33 @@ def get_auth_choice() -> dict:
         }
 
 
-async def main() -> None:
-    """Main entry point."""
+def ask_another_test() -> bool:
+    """Ask user if they want to run another test."""
+    print("\n" + "-" * 40)
+    while True:
+        choice = input("Run another test? (y/n): ").strip().lower()
+        if choice in ("y", "yes"):
+            return True
+        elif choice in ("n", "no", ""):
+            return False
+        else:
+            print("Please enter 'y' or 'n'.")
+
+
+async def run_single_test() -> bool:
+    """Run a single test cycle. Returns True if successful."""
     # Get auth method and credentials
     auth_info = get_auth_choice()
+
+    # Get test mode
+    test_mode = get_test_mode()
+    auth_info["test_mode"] = test_mode
+
+    # Get proxy configuration
+    proxy, verify_ssl = get_proxy_choice()
+    if proxy:
+        auth_info["proxy"] = proxy
+    auth_info["verify_ssl"] = verify_ssl
 
     # Setup output directory
     output_dir = Path("test_output") / datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -710,17 +867,30 @@ async def main() -> None:
     test = IntegrationTest(output_dir)
 
     try:
-        success = await test.run(**auth_info)
-        sys.exit(0 if success else 1)
-    except KeyboardInterrupt:
-        print("\n\nTest interrupted by user")
-        test.generate_report()
-        sys.exit(130)
+        return await test.run(**auth_info)
     except Exception as e:
         print(f"\n\nUnexpected error: {e}")
         test.logger.exception("Unexpected error")
         test.generate_report()
-        sys.exit(1)
+        return False
+
+
+async def main() -> None:
+    """Main entry point."""
+    last_success = True
+
+    try:
+        while True:
+            last_success = await run_single_test()
+
+            if not ask_another_test():
+                break
+
+    except KeyboardInterrupt:
+        print("\n\nTest interrupted by user")
+
+    print("\nGoodbye!")
+    sys.exit(0 if last_success else 1)
 
 
 if __name__ == "__main__":

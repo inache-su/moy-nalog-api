@@ -29,6 +29,7 @@
 | **Обработка ошибок** | Типизированная иерархия исключений | Общие исключения |
 | **Повторные попытки** | Встроенный exponential backoff | Обычно отсутствует |
 | **Несколько позиций** | Нативная поддержка мульти-чеков | Только одна позиция |
+| **Поддержка прокси** | HTTP, HTTPS, SOCKS4/5 | Часто отсутствует |
 | **Документация** | Подробная с примерами | Часто минимальная |
 
 ## Возможности
@@ -42,12 +43,18 @@
 - Все типы клиентов (физлицо, юрлицо, иностранная организация)
 - Список доходов с пагинацией и фильтрацией
 - Отмена чеков с указанием причины
+- Поддержка HTTP/HTTPS и SOCKS прокси
 - Полная типизация для поддержки IDE
 
 ## Установка
 
 ```bash
 pip install moy-nalog-api
+```
+
+Для поддержки SOCKS-прокси:
+```bash
+pip install moy-nalog-api[socks]
 ```
 
 Для разработки:
@@ -399,7 +406,54 @@ client = MoyNalogClient(
 
     # Авто-обновление токенов до истечения (по умолчанию: True)
     auto_refresh_token=True,
+
+    # URL прокси-сервера (опционально)
+    proxy="http://proxy.example.com:8080",
 )
+```
+
+## Поддержка прокси
+
+Клиент поддерживает HTTP, HTTPS и SOCKS прокси для всех API-запросов.
+
+### HTTP/HTTPS прокси
+
+```python
+# HTTP прокси (работает из коробки)
+client = MoyNalogClient(proxy="http://proxy.example.com:8080")
+
+# С аутентификацией
+client = MoyNalogClient(proxy="http://user:password@proxy.example.com:8080")
+
+# HTTPS прокси
+client = MoyNalogClient(proxy="https://proxy.example.com:8080")
+```
+
+### SOCKS прокси
+
+Для SOCKS-прокси требуется дополнительная зависимость:
+
+```bash
+pip install moy-nalog-api[socks]
+```
+
+```python
+# SOCKS5 прокси
+client = MoyNalogClient(proxy="socks5://proxy.example.com:1080")
+
+# SOCKS5 с аутентификацией
+client = MoyNalogClient(proxy="socks5://user:password@proxy.example.com:1080")
+
+# SOCKS4 прокси
+client = MoyNalogClient(proxy="socks4://proxy.example.com:1080")
+```
+
+### Синхронный клиент
+
+Синхронная обёртка также поддерживает прокси:
+
+```python
+client = MoyNalogClientSync(proxy="http://proxy.example.com:8080")
 ```
 
 ## Профиль пользователя

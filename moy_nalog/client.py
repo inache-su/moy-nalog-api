@@ -93,6 +93,8 @@ class MoyNalogClient:
         max_retries: int = 3,
         session_file: str | Path | None = None,
         auto_refresh_token: bool = True,
+        proxy: str | None = None,
+        verify_ssl: bool = True,
     ) -> None:
         """
         Initialize the API client.
@@ -103,12 +105,22 @@ class MoyNalogClient:
             max_retries: Maximum retry attempts for failed requests
             session_file: Path to session file for persistence (optional)
             auto_refresh_token: Automatically refresh expired tokens
+            proxy: Proxy URL for requests. Supports HTTP/HTTPS and SOCKS5 proxies.
+                   Examples:
+                   - "http://user:pass@proxy.example.com:8080"
+                   - "https://proxy.example.com:8080"
+                   - "socks5://user:pass@proxy.example.com:1080"
+                   For SOCKS5 support, install with: pip install moy-nalog-api[socks]
+            verify_ssl: Verify SSL certificates (default: True).
+                   Set to False when using proxy servers that intercept SSL traffic.
         """
         self.timezone = timezone
         self.timeout = timeout
         self.max_retries = max_retries
         self.session_file = Path(session_file) if session_file else None
         self.auto_refresh_token = auto_refresh_token
+        self.proxy = proxy
+        self.verify_ssl = verify_ssl
 
         self._device_id = self._generate_device_id()
         self._access_token: str | None = None
@@ -222,13 +234,92 @@ class MoyNalogClient:
             headers["Authorization"] = f"Bearer {self._access_token}"
         return headers
 
+    def _is_socks_proxy(self) -> bool:
+        """Check if proxy is a SOCKS proxy."""
+        if not self.proxy:
+            return False
+        return self.proxy.lower().startswith(("socks4://", "socks5://"))
+
+    def _encode_proxy_url(self, proxy_url: str) -> str:
+        """URL-encode username and password in proxy URL if needed."""
+        from urllib.parse import quote, urlparse, urlunparse
+
+        parsed = urlparse(proxy_url)
+
+        # If no credentials, return as-is
+        if not parsed.username:
+            return proxy_url
+
+        # URL-encode username and password
+        encoded_username = quote(parsed.username, safe="")
+        encoded_password = quote(parsed.password or "", safe="") if parsed.password else ""
+
+        # Rebuild netloc with encoded credentials
+        if encoded_password:
+            credentials = f"{encoded_username}:{encoded_password}"
+        else:
+            credentials = encoded_username
+
+        # Rebuild netloc: credentials@host:port
+        if parsed.port:
+            netloc = f"{credentials}@{parsed.hostname}:{parsed.port}"
+        else:
+            netloc = f"{credentials}@{parsed.hostname}"
+
+        # Rebuild full URL
+        return urlunparse((
+            parsed.scheme,
+            netloc,
+            parsed.path,
+            parsed.params,
+            parsed.query,
+            parsed.fragment,
+        ))
+
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create HTTP client."""
         if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(self.timeout),
-                follow_redirects=True,
-            )
+            client_kwargs: dict[str, Any] = {
+                "timeout": httpx.Timeout(self.timeout),
+                "follow_redirects": True,
+                "verify": self.verify_ssl,
+            }
+
+            if self.proxy:
+                # URL-encode credentials in proxy URL
+                encoded_proxy = self._encode_proxy_url(self.proxy)
+
+                if self._is_socks_proxy():
+                    # SOCKS proxy requires httpx-socks
+                    try:
+                        from httpx_socks import (  # type: ignore[import-not-found]
+                            AsyncProxyTransport,
+                        )
+                    except ImportError as e:
+                        raise ImportError(
+                            "SOCKS proxy support requires httpx-socks. "
+                            "Install with: pip install moy-nalog-api[socks]"
+                        ) from e
+                    transport = AsyncProxyTransport.from_url(encoded_proxy)
+                    client_kwargs["transport"] = transport
+                else:
+                    # HTTP/HTTPS proxy - native httpx support
+                    # ssl_context is only needed for https:// proxy connections
+                    is_https_proxy = encoded_proxy.lower().startswith("https://")
+                    if not self.verify_ssl and is_https_proxy:
+                        # Create proxy with SSL verification disabled for HTTPS proxy
+                        import ssl
+                        ssl_context = ssl.create_default_context()
+                        ssl_context.check_hostname = False
+                        ssl_context.verify_mode = ssl.CERT_NONE
+                        client_kwargs["proxy"] = httpx.Proxy(
+                            url=encoded_proxy,
+                            ssl_context=ssl_context,
+                        )
+                    else:
+                        client_kwargs["proxy"] = encoded_proxy
+
+            self._client = httpx.AsyncClient(**client_kwargs)
         return self._client
 
     async def _request(
@@ -787,11 +878,17 @@ class MoyNalogClientSync:
     For use in non-async code. Creates an event loop internally.
     Do not use from within async code - use MoyNalogClient directly instead.
 
+    Accepts all the same arguments as MoyNalogClient, including proxy support.
+
     Example:
         client = MoyNalogClientSync()
         client.auth_by_password("1234567890", "password")
         receipt = client.create_receipt("Service", Decimal("1000"))
         client.close()
+
+    Example with proxy:
+        client = MoyNalogClientSync(proxy="http://proxy.example.com:8080")
+        client.auth_by_password("1234567890", "password")
     """
 
     def __init__(self, **kwargs: Any) -> None:
