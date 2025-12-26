@@ -162,9 +162,15 @@ class MoyNalogClient:
 
     @property
     def is_token_expired(self) -> bool:
-        """Check if access token is expired or about to expire."""
+        """Check if access token is expired or about to expire.
+
+        Returns True if:
+        - Token expiration time is unknown (safer to refresh)
+        - Token is expired or will expire within TOKEN_REFRESH_MARGIN seconds
+        """
         if not self._token_expire_at:
-            return False
+            # Unknown expiration - assume expired to trigger refresh
+            return True
         margin = timedelta(seconds=self.TOKEN_REFRESH_MARGIN)
         # Ensure we compare aware datetimes
         expire_at = self._token_expire_at
@@ -329,6 +335,7 @@ class MoyNalogClient:
         payload: dict[str, Any] | None = None,
         with_auth: bool = False,
         api_version: str = "v1",
+        _allow_retry_on_401: bool = True,
     ) -> dict[str, Any]:
         """
         Make HTTP request with retry logic.
@@ -337,7 +344,7 @@ class MoyNalogClient:
             NetworkError: On network failures
             MoyNalogError: On API errors
         """
-        # Auto-refresh token if needed
+        # Auto-refresh token if needed (before request)
         if with_auth and self.auto_refresh_token and self.is_token_expired and self._refresh_token:
             await self._do_refresh_token()
 
@@ -359,6 +366,20 @@ class MoyNalogClient:
 
                 # Check for API errors
                 if response.status_code == 401:
+                    # Try to refresh token and retry once
+                    if (
+                        with_auth
+                        and _allow_retry_on_401
+                        and self.auto_refresh_token
+                        and self._refresh_token
+                    ):
+                        logger.debug("Got 401, attempting token refresh and retry")
+                        if await self._do_refresh_token():
+                            # Retry with refreshed token (prevent infinite loop)
+                            return await self._request(
+                                method, endpoint, payload, with_auth,
+                                api_version, _allow_retry_on_401=False
+                            )
                     raise TokenExpiredError("Access token expired", response=data)
                 if response.status_code == 429:
                     raise RateLimitError("Rate limit exceeded", response=data)

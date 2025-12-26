@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "moy-nalog-api"
-version = "1.0.2"
+version = "1.0.3"
 description = "The most complete async Python client for Russian self-employed tax service (Moy Nalog / lknpd.nalog.ru)"
 readme = "README.md"
 license = "MIT"
