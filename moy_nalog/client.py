@@ -5,7 +5,6 @@ The most complete and modern Python client for Russian self-employed tax service
 """
 
 import asyncio
-import contextlib
 import json
 import logging
 import random
@@ -77,14 +76,18 @@ class MoyNalogClient:
     API_URL_V1 = "https://lknpd.nalog.ru/api/v1"
     API_URL_V2 = "https://lknpd.nalog.ru/api/v2"
 
-    USER_AGENT = (
+    DEFAULT_TIMEOUT = 30.0
+    TOKEN_REFRESH_MARGIN = 60
+
+    RETRY_BASE_DELAY = 1.0
+    RETRY_MAX_DELAY = 8.0
+    RETRY_JITTER = 1.0
+
+    DEFAULT_USER_AGENT = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
     )
-
-    DEFAULT_TIMEOUT = 30.0
-    TOKEN_REFRESH_MARGIN = 60  # Refresh token 60 seconds before expiry
 
     def __init__(
         self,
@@ -95,6 +98,7 @@ class MoyNalogClient:
         auto_refresh_token: bool = True,
         proxy: str | None = None,
         verify_ssl: bool = True,
+        user_agent: str | None = None,
     ) -> None:
         """
         Initialize the API client.
@@ -113,6 +117,7 @@ class MoyNalogClient:
                    For SOCKS5 support, install with: pip install moy-nalog-api[socks]
             verify_ssl: Verify SSL certificates (default: True).
                    Set to False when using proxy servers that intercept SSL traffic.
+            user_agent: Custom User-Agent header (optional).
         """
         self.timezone = timezone
         self.timeout = timeout
@@ -121,6 +126,7 @@ class MoyNalogClient:
         self.auto_refresh_token = auto_refresh_token
         self.proxy = proxy
         self.verify_ssl = verify_ssl
+        self.user_agent = user_agent or self.DEFAULT_USER_AGENT
 
         self._device_id = self._generate_device_id()
         self._access_token: str | None = None
@@ -129,7 +135,6 @@ class MoyNalogClient:
         self._inn: str | None = None
         self._client: httpx.AsyncClient | None = None
 
-        # Load session if file exists
         if self.session_file:
             self._load_session()
 
@@ -161,6 +166,11 @@ class MoyNalogClient:
         return self._token_expire_at
 
     @property
+    def device_id(self) -> str:
+        """Get device identifier used for API requests."""
+        return self._device_id
+
+    @property
     def is_token_expired(self) -> bool:
         """Check if access token is expired or about to expire.
 
@@ -172,7 +182,6 @@ class MoyNalogClient:
             # Unknown expiration - assume expired to trigger refresh
             return True
         margin = timedelta(seconds=self.TOKEN_REFRESH_MARGIN)
-        # Ensure we compare aware datetimes
         expire_at = self._token_expire_at
         if expire_at.tzinfo is None:
             expire_at = expire_at.replace(tzinfo=timezone.utc)
@@ -209,6 +218,54 @@ class MoyNalogClient:
         chars = string.ascii_letters + string.digits
         return "".join(secrets.choice(chars) for _ in range(21))
 
+    @staticmethod
+    def _parse_datetime(value: str) -> datetime:
+        """Parse ISO 8601 datetime string, handling 'Z' suffix for UTC.
+
+        Python 3.11+ supports 'Z' natively, but we support 3.10.
+        """
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+        return datetime.fromisoformat(value)
+
+    @staticmethod
+    def _normalize_phone(phone: str) -> str:
+        """Normalize phone number to 11-digit format starting with 7.
+
+        Args:
+            phone: Phone number in various formats
+
+        Returns:
+            Normalized 11-digit phone number
+
+        Raises:
+            ValidationError: If phone format is invalid
+        """
+        phone = "".join(c for c in phone if c.isdigit())
+        if len(phone) == 10:
+            phone = "7" + phone
+        if len(phone) != 11 or not phone.startswith("7"):
+            raise ValidationError("Phone must be 11 digits starting with 7 (e.g., 79001234567)")
+        return phone
+
+    @staticmethod
+    def _validate_receipt_uuid(value: str) -> str:
+        """Validate receipt UUID format.
+
+        Args:
+            value: Receipt UUID
+
+        Returns:
+            Cleaned UUID string
+
+        Raises:
+            ValidationError: If UUID format is invalid
+        """
+        value = value.strip()
+        if not value:
+            raise ValidationError("Receipt UUID cannot be empty")
+        return value
+
     def _get_tz(self) -> ZoneInfo:
         """Get timezone object."""
         return ZoneInfo(self.timezone)
@@ -223,7 +280,7 @@ class MoyNalogClient:
             "sourceType": "WEB",
             "sourceDeviceId": self._device_id,
             "appVersion": "1.0.0",
-            "metaDetails": {"userAgent": self.USER_AGENT},
+            "metaDetails": {"userAgent": self.user_agent},
         }
 
     def _get_headers(self, with_auth: bool = False) -> dict[str, str]:
@@ -233,7 +290,7 @@ class MoyNalogClient:
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
             "Cache-Control": "no-cache",
-            "User-Agent": self.USER_AGENT,
+            "User-Agent": self.user_agent,
             "Referer": "https://lknpd.nalog.ru/",
         }
         if with_auth and self._access_token:
@@ -252,27 +309,22 @@ class MoyNalogClient:
 
         parsed = urlparse(proxy_url)
 
-        # If no credentials, return as-is
         if not parsed.username:
             return proxy_url
 
-        # URL-encode username and password
         encoded_username = quote(parsed.username, safe="")
         encoded_password = quote(parsed.password or "", safe="") if parsed.password else ""
 
-        # Rebuild netloc with encoded credentials
         if encoded_password:
             credentials = f"{encoded_username}:{encoded_password}"
         else:
             credentials = encoded_username
 
-        # Rebuild netloc: credentials@host:port
         if parsed.port:
             netloc = f"{credentials}@{parsed.hostname}:{parsed.port}"
         else:
             netloc = f"{credentials}@{parsed.hostname}"
 
-        # Rebuild full URL
         return urlunparse((
             parsed.scheme,
             netloc,
@@ -344,7 +396,6 @@ class MoyNalogClient:
             NetworkError: On network failures
             MoyNalogError: On API errors
         """
-        # Auto-refresh token if needed (before request)
         if with_auth and self.auto_refresh_token and self.is_token_expired and self._refresh_token:
             await self._do_refresh_token()
 
@@ -362,11 +413,14 @@ class MoyNalogClient:
                 else:
                     response = await client.post(url, headers=headers, json=payload)
 
-                data = response.json() if response.text else {}
+                data: dict[str, Any] = {}
+                if response.text:
+                    try:  # noqa: SIM105
+                        data = response.json()
+                    except json.JSONDecodeError:
+                        pass
 
-                # Check for API errors
                 if response.status_code == 401:
-                    # Try to refresh token and retry once
                     if (
                         with_auth
                         and _allow_retry_on_401
@@ -375,7 +429,6 @@ class MoyNalogClient:
                     ):
                         logger.debug("Got 401, attempting token refresh and retry")
                         if await self._do_refresh_token():
-                            # Retry with refreshed token (prevent infinite loop)
                             return await self._request(
                                 method, endpoint, payload, with_auth,
                                 api_version, _allow_retry_on_401=False
@@ -399,10 +452,16 @@ class MoyNalogClient:
             except Exception as e:
                 last_error = MoyNalogError(f"Unexpected error: {e}")
 
-            # Exponential backoff
             if attempt < self.max_retries - 1:
-                delay = min(2 ** attempt, 8) + random.uniform(0, 1)
-                logger.warning(f"Request failed, retrying in {delay:.1f}s: {last_error}")
+                base_delay = min(
+                    self.RETRY_BASE_DELAY * (2 ** attempt),
+                    self.RETRY_MAX_DELAY,
+                )
+                delay = base_delay + random.uniform(0, self.RETRY_JITTER)
+                logger.warning(
+                    f"Request failed (attempt {attempt + 1}/{self.max_retries}), "
+                    f"retrying in {delay:.1f}s: {last_error}"
+                )
                 await asyncio.sleep(delay)
 
         if last_error is not None:
@@ -461,8 +520,10 @@ class MoyNalogClient:
         self._token_expire_at = None
 
         if self.session_file and self.session_file.exists():
-            with contextlib.suppress(Exception):
+            try:
                 self.session_file.unlink()
+            except OSError as e:
+                logger.debug(f"Failed to delete session file: {e}")
 
     def set_tokens(
         self,
@@ -494,7 +555,6 @@ class MoyNalogClient:
             InvalidCredentialsError: Wrong username or password
             AuthenticationError: Other auth errors
         """
-        # Validate input
         username = username.strip()
         if not username:
             raise ValidationError("Username cannot be empty")
@@ -540,12 +600,7 @@ class MoyNalogClient:
             SMSRateLimitError: Too many SMS requests
             SMSError: Other SMS errors
         """
-        # Clean phone number
-        phone = "".join(c for c in phone if c.isdigit())
-        if len(phone) == 10:
-            phone = "7" + phone
-        if len(phone) != 11 or not phone.startswith("7"):
-            raise ValidationError("Phone must be 11 digits starting with 7 (e.g., 79001234567)")
+        phone = self._normalize_phone(phone)
 
         payload = {
             "phone": phone,
@@ -577,10 +632,7 @@ class MoyNalogClient:
             InvalidSMSCodeError: Wrong verification code
             SMSError: Other SMS errors
         """
-        # Clean inputs
-        phone = "".join(c for c in phone if c.isdigit())
-        if len(phone) == 10:
-            phone = "7" + phone
+        phone = self._normalize_phone(phone)
         code = code.strip()
 
         if not code.isdigit() or len(code) != 6:
@@ -631,8 +683,11 @@ class MoyNalogClient:
             if new_refresh := data.get("refreshToken"):
                 self._refresh_token = new_refresh
             if expire_in := data.get("tokenExpireIn"):
-                with contextlib.suppress(ValueError, AttributeError):
-                    self._token_expire_at = datetime.fromisoformat(expire_in.replace("Z", "+00:00"))
+                try:
+                    self._token_expire_at = self._parse_datetime(expire_in)
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"Failed to parse token expiration '{expire_in}': {e}")
+                    self._token_expire_at = datetime.now(timezone.utc) + timedelta(hours=1)
 
             if self.session_file:
                 self._save_session()
@@ -712,16 +767,13 @@ class MoyNalogClient:
         if not items:
             raise ValidationError("Items list cannot be empty")
 
-        # Calculate total
         total_amount = sum(item.total for item in items)
 
-        # Format times
         tz = self._get_tz()
         now = datetime.now(tz)
         op_time_dt = (operation_time or now).astimezone(tz)
         req_time_dt = now
 
-        # Build client data
         client_data = (client or Client()).to_api_dict()
 
         payload = {
@@ -743,7 +795,6 @@ class MoyNalogClient:
         if not receipt_uuid:
             raise ReceiptError("No receipt UUID in response", response=data)
 
-        # Build receipt object
         receipt = Receipt(
             uuid=receipt_uuid,
             total_amount=total_amount,
@@ -780,6 +831,8 @@ class MoyNalogClient:
         """
         if not self.is_authenticated:
             raise AuthenticationError("Not authenticated")
+
+        receipt_uuid = self._validate_receipt_uuid(receipt_uuid)
 
         tz = self._get_tz()
         op_time = (operation_time or datetime.now(tz)).astimezone(tz).isoformat()
@@ -821,16 +874,96 @@ class MoyNalogClient:
         if not self.is_authenticated or not self._inn:
             raise AuthenticationError("Not authenticated")
 
+        receipt_uuid = self._validate_receipt_uuid(receipt_uuid)
+
         try:
             return await self._request("GET", f"/receipt/{self._inn}/{receipt_uuid}/json", with_auth=True)
         except MoyNalogError:
             return None
 
     def get_receipt_print_url(self, receipt_uuid: str) -> str:
-        """Get URL for printable receipt form."""
+        """Get URL for printable receipt form.
+
+        Args:
+            receipt_uuid: Receipt UUID
+
+        Returns:
+            URL string for printable receipt
+
+        Raises:
+            AuthenticationError: If not authenticated
+            ValidationError: If receipt_uuid is invalid
+        """
         if not self._inn:
             raise AuthenticationError("Not authenticated (INN unknown)")
+        receipt_uuid = self._validate_receipt_uuid(receipt_uuid)
         return f"{self.API_URL_V1}/receipt/{self._inn}/{receipt_uuid}/print"
+
+    async def download_receipt_raw(
+        self,
+        receipt_uuid: str,
+        format: str = "json",
+    ) -> bytes | None:
+        """
+        Download receipt in specified format with retry logic.
+
+        Args:
+            receipt_uuid: Receipt UUID
+            format: Output format - "json" or "print" (default: "json")
+
+        Returns:
+            Raw bytes of receipt data, or None if not found
+
+        Raises:
+            AuthenticationError: If not authenticated
+            ValidationError: If format is invalid
+        """
+        if not self.is_authenticated or not self._inn:
+            raise AuthenticationError("Not authenticated")
+
+        receipt_uuid = self._validate_receipt_uuid(receipt_uuid)
+
+        if format not in ("json", "print"):
+            raise ValidationError("Format must be 'json' or 'print'")
+
+        endpoint = f"/receipt/{self._inn}/{receipt_uuid}/{format}"
+        client = await self._get_client()
+        headers = self._get_headers(with_auth=True)
+
+        last_error: Exception | None = None
+
+        for attempt in range(self.max_retries):
+            try:
+                response = await client.get(
+                    f"{self.API_URL_V1}{endpoint}",
+                    headers=headers,
+                    follow_redirects=True,
+                )
+                if response.status_code == 200:
+                    return response.content
+                if response.status_code == 404:
+                    return None
+                last_error = NetworkError(f"HTTP {response.status_code}")
+
+            except httpx.TimeoutException as e:
+                last_error = NetworkError(f"Request timeout: {e}")
+            except httpx.RequestError as e:
+                last_error = NetworkError(f"Network error: {e}")
+
+            if attempt < self.max_retries - 1:
+                base_delay = min(
+                    self.RETRY_BASE_DELAY * (2 ** attempt),
+                    self.RETRY_MAX_DELAY,
+                )
+                delay = base_delay + random.uniform(0, self.RETRY_JITTER)
+                logger.warning(
+                    f"Download receipt failed (attempt {attempt + 1}/{self.max_retries}), "
+                    f"retrying in {delay:.1f}s: {last_error}"
+                )
+                await asyncio.sleep(delay)
+
+        logger.warning(f"Failed to download receipt {receipt_uuid} after {self.max_retries} attempts: {last_error}")
+        return None
 
     # ==================== INCOMES ====================
 
@@ -899,6 +1032,8 @@ class MoyNalogClientSync:
     For use in non-async code. Creates an event loop internally.
     Do not use from within async code - use MoyNalogClient directly instead.
 
+    This class is NOT thread-safe. Each thread should create its own instance.
+
     Accepts all the same arguments as MoyNalogClient, including proxy support.
 
     Example:
@@ -906,6 +1041,11 @@ class MoyNalogClientSync:
         client.auth_by_password("1234567890", "password")
         receipt = client.create_receipt("Service", Decimal("1000"))
         client.close()
+
+    Example with context manager:
+        with MoyNalogClientSync() as client:
+            client.auth_by_password("1234567890", "password")
+            receipt = client.create_receipt("Service", Decimal("1000"))
 
     Example with proxy:
         client = MoyNalogClientSync(proxy="http://proxy.example.com:8080")
@@ -916,8 +1056,11 @@ class MoyNalogClientSync:
         self._client = MoyNalogClient(**kwargs)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._owns_loop = False
+        self._closed = False
 
     def _get_loop(self) -> asyncio.AbstractEventLoop:
+        if self._closed:
+            raise RuntimeError("Client is closed")
         if self._loop is None or self._loop.is_closed():
             # Check if we're in an async context
             try:
@@ -938,10 +1081,24 @@ class MoyNalogClientSync:
         return self._get_loop().run_until_complete(coro)
 
     def close(self) -> None:
-        self._run(self._client.close())
-        if self._owns_loop and self._loop and not self._loop.is_running():
-            self._loop.close()
-            self._loop = None
+        """Close the client and release resources."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._loop and not self._loop.is_closed():
+            self._loop.run_until_complete(self._client.close())
+            if self._owns_loop:
+                self._loop.close()
+        self._loop = None
+
+    def __del__(self) -> None:
+        """Ensure resources are cleaned up."""
+        if not self._closed:
+            # Best effort cleanup - may not work in all cases
+            try:  # noqa: SIM105
+                self.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def __enter__(self) -> "MoyNalogClientSync":
         return self
@@ -954,7 +1111,6 @@ class MoyNalogClientSync:
     ) -> None:
         self.close()
 
-    # Proxy properties
     @property
     def is_authenticated(self) -> bool:
         return self._client.is_authenticated
@@ -979,7 +1135,11 @@ class MoyNalogClientSync:
     def is_token_expired(self) -> bool:
         return self._client.is_token_expired
 
-    # Proxy methods
+    @property
+    def device_id(self) -> str:
+        """Get device identifier used for API requests."""
+        return self._client.device_id
+
     def set_tokens(
         self,
         access_token: str,
@@ -1012,6 +1172,9 @@ class MoyNalogClientSync:
 
     def get_receipt_print_url(self, receipt_uuid: str) -> str:
         return self._client.get_receipt_print_url(receipt_uuid)
+
+    def download_receipt_raw(self, receipt_uuid: str, format: str = "json") -> bytes | None:
+        return self._run(self._client.download_receipt_raw(receipt_uuid, format))
 
     def get_incomes(self, **kwargs: Any) -> IncomeList:
         return self._run(self._client.get_incomes(**kwargs))

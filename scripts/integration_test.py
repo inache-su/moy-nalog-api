@@ -96,38 +96,23 @@ class IntegrationTest:
             self.logger.debug(f"       Details: {details}")
 
     async def download_receipt(self, client: MoyNalogClient, receipt_uuid: str) -> bool:
-        """Download receipt in PDF and JSON formats."""
+        """Download receipt in JSON and printable formats using public API."""
         self.logger.debug(f"Downloading receipt {receipt_uuid}...")
 
         try:
-            http_client = await client._get_client()
-            headers = client._get_headers(with_auth=True)
-
-            # Download JSON
-            json_url = f"{client.API_URL_V1}/receipt/{client.inn}/{receipt_uuid}/json"
-            json_response = await http_client.get(json_url, headers=headers)
-
-            if json_response.status_code == 200:
+            # Download JSON using public API
+            json_content = await client.download_receipt_raw(receipt_uuid, "json")
+            if json_content:
                 json_path = self.receipts_dir / f"{receipt_uuid}.json"
-                json_path.write_text(json_response.text, encoding="utf-8")
+                json_path.write_bytes(json_content)
                 self.logger.debug(f"Saved JSON: {json_path}")
 
-            # Download printable version (HTML/PDF)
-            print_url = f"{client.API_URL_V1}/receipt/{client.inn}/{receipt_uuid}/print"
-            print_response = await http_client.get(print_url, headers=headers, follow_redirects=True)
-
-            if print_response.status_code == 200:
-                # Determine extension based on content type
-                content_type = print_response.headers.get("content-type", "")
-                if "pdf" in content_type:
-                    ext = "pdf"
-                elif "html" in content_type:
-                    ext = "html"
-                else:
-                    ext = "bin"
-
-                print_path = self.receipts_dir / f"{receipt_uuid}.{ext}"
-                print_path.write_bytes(print_response.content)
+            # Download printable version using public API
+            print_content = await client.download_receipt_raw(receipt_uuid, "print")
+            if print_content:
+                # Default to .html extension since we don't have content-type info
+                print_path = self.receipts_dir / f"{receipt_uuid}.html"
+                print_path.write_bytes(print_content)
                 self.logger.debug(f"Saved printable: {print_path}")
 
             return True

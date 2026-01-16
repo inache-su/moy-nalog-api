@@ -339,6 +339,22 @@ if data:
 url = client.get_receipt_print_url("receipt_uuid")
 ```
 
+### Download Receipt
+
+Download receipt as raw bytes for saving or processing:
+
+```python
+# Download as JSON
+json_bytes = await client.download_receipt_raw("receipt_uuid", format="json")
+with open("receipt.json", "wb") as f:
+    f.write(json_bytes)
+
+# Download as PNG image (for printing)
+png_bytes = await client.download_receipt_raw("receipt_uuid", format="print")
+with open("receipt.png", "wb") as f:
+    f.write(png_bytes)
+```
+
 ## Error Handling
 
 ```python
@@ -409,6 +425,9 @@ client = MoyNalogClient(
 
     # Proxy server URL (optional)
     proxy="http://proxy.example.com:8080",
+
+    # Custom User-Agent header (optional)
+    user_agent="MyApp/1.0",
 )
 ```
 

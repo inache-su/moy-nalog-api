@@ -339,6 +339,22 @@ if data:
 url = client.get_receipt_print_url("receipt_uuid")
 ```
 
+### Скачивание чека
+
+Скачивание чека в виде сырых байтов для сохранения или обработки:
+
+```python
+# Скачать как JSON
+json_bytes = await client.download_receipt_raw("receipt_uuid", format="json")
+with open("receipt.json", "wb") as f:
+    f.write(json_bytes)
+
+# Скачать как PNG изображение (для печати)
+png_bytes = await client.download_receipt_raw("receipt_uuid", format="print")
+with open("receipt.png", "wb") as f:
+    f.write(png_bytes)
+```
+
 ## Обработка ошибок
 
 ```python
@@ -409,6 +425,9 @@ client = MoyNalogClient(
 
     # URL прокси-сервера (опционально)
     proxy="http://proxy.example.com:8080",
+
+    # Пользовательский User-Agent (опционально)
+    user_agent="MyApp/1.0",
 )
 ```
 

@@ -32,8 +32,8 @@ class TestMoyNalogClient:
 
     def test_device_id_generation(self):
         client = MoyNalogClient()
-        assert len(client._device_id) == 21
-        assert client._device_id.isalnum()
+        assert len(client.device_id) == 21
+        assert client.device_id.isalnum()
 
     def test_not_authenticated_by_default(self):
         client = MoyNalogClient()
