@@ -21,8 +21,9 @@ import asyncio
 import getpass
 import json
 import logging
+import re
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -49,7 +50,7 @@ class IntegrationTest:
         self.receipts_dir = output_dir / "receipts"
         self.receipts_dir.mkdir(exist_ok=True)
 
-        self.log_file = output_dir / f"test_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        self.log_file = output_dir / f"test_log_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.log"
         self.created_receipts: list[str] = []
         self.test_results: list[dict] = []
 
@@ -84,7 +85,7 @@ class IntegrationTest:
             "name": name,
             "success": success,
             "details": details,
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         })
 
         if success:
@@ -568,9 +569,9 @@ class IntegrationTest:
         self.logger.info(f"Log file: {self.log_file}")
 
         # Save JSON report
-        report_file = self.output_dir / f"test_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        report_file = self.output_dir / f"test_report_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
         report_data = {
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "summary": {
                 "total": total,
                 "passed": passed,
@@ -606,12 +607,11 @@ class IntegrationTest:
         """
         self.logger.info("=" * 60)
         self.logger.info("MOY NALOG API - INTEGRATION TEST")
-        self.logger.info(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        self.logger.info(f"Started at: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
         self.logger.info(f"Test mode: {test_mode.upper()}")
         self.logger.info(f"Auth method: {auth_method.upper()}")
         if proxy:
             # Hide password in proxy URL for logging
-            import re
             safe_proxy = re.sub(r'://([^:]+):([^@]+)@', r'://\1:***@', proxy)
             self.logger.info(f"Proxy: {safe_proxy}")
             self.logger.info(f"SSL verify: {verify_ssl}")
@@ -873,6 +873,7 @@ async def main() -> None:
 
     except KeyboardInterrupt:
         print("\n\nTest interrupted by user")
+        sys.exit(130)
 
     print("\nGoodbye!")
     sys.exit(0 if last_success else 1)
