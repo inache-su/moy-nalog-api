@@ -266,6 +266,35 @@ class MoyNalogClient:
             raise ValidationError("Receipt UUID cannot be empty")
         return value
 
+    async def _retry_delay(self, attempt: int, context: str, error: Exception | None) -> None:
+        """Sleep with exponential backoff before next retry."""
+        base_delay = min(
+            self.RETRY_BASE_DELAY * (2 ** attempt),
+            self.RETRY_MAX_DELAY,
+        )
+        delay = base_delay + random.uniform(0, self.RETRY_JITTER)
+        logger.warning(
+            f"{context} (attempt {attempt + 1}/{self.max_retries}), "
+            f"retrying in {delay:.1f}s: {error}"
+        )
+        await asyncio.sleep(delay)
+
+    async def _process_auth_result(self, data: dict[str, Any], method: str) -> UserProfile:
+        """Store tokens from auth response and return profile."""
+        result = AuthResult.model_validate(data)
+        self._access_token = result.access_token
+        self._refresh_token = result.refresh_token
+        self._token_expire_at = result.token_expire_in
+
+        profile = result.profile or UserProfile.model_validate(data.get("profile", {}))
+        self._inn = profile.inn
+
+        if self.session_file:
+            self._save_session()
+
+        logger.info(f"Authenticated by {method}, INN: {self._inn}")
+        return profile
+
     def _get_tz(self) -> ZoneInfo:
         """Get timezone object."""
         return ZoneInfo(self.timezone)
@@ -303,7 +332,8 @@ class MoyNalogClient:
             return False
         return self.proxy.lower().startswith(("socks4://", "socks5://"))
 
-    def _encode_proxy_url(self, proxy_url: str) -> str:
+    @staticmethod
+    def _encode_proxy_url(proxy_url: str) -> str:
         """URL-encode username and password in proxy URL if needed."""
         from urllib.parse import quote, urlparse, urlunparse
 
@@ -453,16 +483,7 @@ class MoyNalogClient:
                 last_error = MoyNalogError(f"Unexpected error: {e}")
 
             if attempt < self.max_retries - 1:
-                base_delay = min(
-                    self.RETRY_BASE_DELAY * (2 ** attempt),
-                    self.RETRY_MAX_DELAY,
-                )
-                delay = base_delay + random.uniform(0, self.RETRY_JITTER)
-                logger.warning(
-                    f"Request failed (attempt {attempt + 1}/{self.max_retries}), "
-                    f"retrying in {delay:.1f}s: {last_error}"
-                )
-                await asyncio.sleep(delay)
+                await self._retry_delay(attempt, "Request failed", last_error)
 
         if last_error is not None:
             raise last_error
@@ -572,19 +593,7 @@ class MoyNalogClient:
                 raise InvalidCredentialsError(str(e), response=e.response) from e
             raise AuthenticationError(str(e), response=e.response) from e
 
-        result = AuthResult.model_validate(data)
-        self._access_token = result.access_token
-        self._refresh_token = result.refresh_token
-        self._token_expire_at = result.token_expire_in
-
-        profile = result.profile or UserProfile.model_validate(data.get("profile", {}))
-        self._inn = profile.inn
-
-        if self.session_file:
-            self._save_session()
-
-        logger.info(f"Authenticated by password, INN: {self._inn}")
-        return profile
+        return await self._process_auth_result(data, "password")
 
     async def request_sms_code(self, phone: str) -> SMSChallenge:
         """
@@ -653,19 +662,7 @@ class MoyNalogClient:
                 raise InvalidSMSCodeError(str(e), response=e.response) from e
             raise SMSError(str(e), response=e.response) from e
 
-        result = AuthResult.model_validate(data)
-        self._access_token = result.access_token
-        self._refresh_token = result.refresh_token
-        self._token_expire_at = result.token_expire_in
-
-        profile = result.profile or UserProfile.model_validate(data.get("profile", {}))
-        self._inn = profile.inn
-
-        if self.session_file:
-            self._save_session()
-
-        logger.info(f"Authenticated by SMS, INN: {self._inn}")
-        return profile
+        return await self._process_auth_result(data, "SMS")
 
     async def _do_refresh_token(self) -> bool:
         """Refresh access token using refresh token."""
@@ -679,7 +676,11 @@ class MoyNalogClient:
 
         try:
             data = await self._request("POST", "/auth/token", payload)
-            self._access_token = data.get("token")
+            new_token = data.get("token")
+            if not new_token:
+                logger.warning("Token refresh response missing 'token' field")
+                return False
+            self._access_token = new_token
             if new_refresh := data.get("refreshToken"):
                 self._refresh_token = new_refresh
             if expire_in := data.get("tokenExpireIn"):
@@ -951,16 +952,7 @@ class MoyNalogClient:
                 last_error = NetworkError(f"Network error: {e}")
 
             if attempt < self.max_retries - 1:
-                base_delay = min(
-                    self.RETRY_BASE_DELAY * (2 ** attempt),
-                    self.RETRY_MAX_DELAY,
-                )
-                delay = base_delay + random.uniform(0, self.RETRY_JITTER)
-                logger.warning(
-                    f"Download receipt failed (attempt {attempt + 1}/{self.max_retries}), "
-                    f"retrying in {delay:.1f}s: {last_error}"
-                )
-                await asyncio.sleep(delay)
+                await self._retry_delay(attempt, "Download receipt failed", last_error)
 
         logger.warning(f"Failed to download receipt {receipt_uuid} after {self.max_retries} attempts: {last_error}")
         return None
