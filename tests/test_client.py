@@ -41,19 +41,16 @@ class TestMoyNalogClient:
         assert client.inn is None
         assert client.access_token is None
 
-    @pytest.mark.asyncio
     async def test_create_receipt_not_authenticated(self):
         async with MoyNalogClient() as client:
             with pytest.raises(AuthenticationError):
                 await client.create_receipt("Test", Decimal("100"))
 
-    @pytest.mark.asyncio
     async def test_cancel_receipt_not_authenticated(self):
         async with MoyNalogClient() as client:
             with pytest.raises(AuthenticationError):
                 await client.cancel_receipt("test-uuid")
 
-    @pytest.mark.asyncio
     async def test_get_incomes_not_authenticated(self):
         async with MoyNalogClient() as client:
             with pytest.raises(AuthenticationError):
@@ -92,19 +89,16 @@ class TestMoyNalogClientSync:
 
 
 class TestValidation:
-    @pytest.mark.asyncio
     async def test_request_sms_invalid_phone(self):
         async with MoyNalogClient() as client:
             with pytest.raises(ValidationError):
                 await client.request_sms_code("123")  # Too short
 
-    @pytest.mark.asyncio
     async def test_auth_by_sms_invalid_code(self):
         async with MoyNalogClient() as client:
             with pytest.raises(ValidationError):
                 await client.auth_by_sms("79001234567", "token", "abc")  # Not digits
 
-    @pytest.mark.asyncio
     async def test_auth_by_password_empty_username(self):
         async with MoyNalogClient() as client:
             with pytest.raises(ValidationError):
