@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.5] - 2026-05-30
+
+### Security
+- Session files are now written with owner-only permissions (`0o600`) instead of inheriting the process umask, so other local users can no longer read stored access/refresh tokens and INN
+
+### Fixed
+- `download_receipt_raw()` now refreshes the token on a `401` and raises `RateLimitError` on `429`, instead of silently returning `None` when the access token has expired
+- `get_receipt()` no longer hides `RateLimitError`, `TokenExpiredError`, and `AuthenticationError` behind a `None` result — these are re-raised; only a genuinely missing receipt returns `None`
+- `create_receipt()` / `create_receipt_multi()` raise `AuthenticationError` when the INN is unknown instead of building receipt URLs containing `None`
+- Authentication errors are classified by the API message and error code rather than the formatted exception string, avoiding false keyword matches
+
+### Changed
+- A `401` during a request triggers a single token refresh inside the retry loop instead of a recursive call, keeping one shared retry budget
+- Unexpected (non-network) errors raised inside the request loop now propagate immediately with their original traceback instead of being retried
+- `refresh_access_token()` only treats network/API failures as a failed refresh; unexpected programming errors now propagate
+- Session writes triggered from async methods are offloaded to a thread executor to avoid blocking the event loop
+- The synchronous client's async-context detection no longer depends on matching a CPython runtime error message
+
+### Removed
+- Unused internal `_get_current_time` helper
+
+### Documentation
+- Clarified that password authentication requires an INN; phone-number login goes through the SMS flow (`request_sms_code()` / `auth_by_sms()`)
+
+> Note: the `get_receipt()` and `download_receipt_raw()` changes alter observable behavior — they now raise on auth/rate-limit errors where earlier versions returned `None`. Callers that relied on `None` for those cases should handle the exceptions.
+
 ## [1.0.4] - 2026-01-16
 
 ### Added

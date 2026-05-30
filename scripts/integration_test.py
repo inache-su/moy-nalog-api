@@ -60,6 +60,13 @@ class IntegrationTest:
         """Configure logging to file and console."""
         self.logger = logging.getLogger("integration_test")
         self.logger.setLevel(logging.DEBUG)
+        self.logger.propagate = False
+
+        # getLogger returns the same logger per name, so drop handlers left by a
+        # previous run before adding new ones to avoid duplicated output.
+        for handler in self.logger.handlers[:]:
+            self.logger.removeHandler(handler)
+            handler.close()
 
         # File handler - detailed
         file_handler = logging.FileHandler(self.log_file, encoding="utf-8")

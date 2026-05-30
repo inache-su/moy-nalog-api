@@ -7,6 +7,7 @@ The most complete and modern Python client for Russian self-employed tax service
 import asyncio
 import json
 import logging
+import os
 import random
 import secrets
 import string
@@ -208,7 +209,7 @@ class MoyNalogClient:
             await self._client.aclose()
             self._client = None
         if self.session_file and self.is_authenticated:
-            self._save_session()
+            await self._save_session_async()
 
     # ==================== INTERNAL METHODS ====================
 
@@ -247,6 +248,11 @@ class MoyNalogClient:
         if len(phone) != 11 or not phone.startswith("7"):
             raise ValidationError("Phone must be 11 digits starting with 7 (e.g., 79001234567)")
         return phone
+
+    @staticmethod
+    def _error_haystack(error: MoyNalogError) -> str:
+        """Lowercased message and code of an error, for keyword classification."""
+        return f"{error.message} {error.code or ''}".lower()
 
     @staticmethod
     def _validate_receipt_uuid(value: str) -> str:
@@ -290,7 +296,7 @@ class MoyNalogClient:
         self._inn = profile.inn
 
         if self.session_file:
-            self._save_session()
+            await self._save_session_async()
 
         logger.info(f"Authenticated by {method}, INN: {self._inn}")
         return profile
@@ -298,10 +304,6 @@ class MoyNalogClient:
     def _get_tz(self) -> ZoneInfo:
         """Get timezone object."""
         return ZoneInfo(self.timezone)
-
-    def _get_current_time(self) -> str:
-        """Get current time in ISO 8601 format with timezone."""
-        return datetime.now(self._get_tz()).isoformat()
 
     def _get_device_info(self) -> dict[str, Any]:
         """Get device info for API requests."""
@@ -435,6 +437,7 @@ class MoyNalogClient:
         client = await self._get_client()
 
         last_error: Exception | None = None
+        refreshed_on_401 = False
 
         for attempt in range(self.max_retries):
             try:
@@ -454,15 +457,15 @@ class MoyNalogClient:
                     if (
                         with_auth
                         and _allow_retry_on_401
+                        and not refreshed_on_401
                         and self.auto_refresh_token
                         and self._refresh_token
                     ):
                         logger.debug("Got 401, attempting token refresh and retry")
                         if await self._do_refresh_token():
-                            return await self._request(
-                                method, endpoint, payload, with_auth,
-                                api_version, _allow_retry_on_401=False
-                            )
+                            refreshed_on_401 = True
+                            headers = self._get_headers(with_auth)
+                            continue
                     raise TokenExpiredError("Access token expired", response=data)
                 if response.status_code == 429:
                     raise RateLimitError("Rate limit exceeded", response=data)
@@ -480,7 +483,8 @@ class MoyNalogClient:
             except (TokenExpiredError, RateLimitError, MoyNalogError):
                 raise
             except Exception as e:
-                last_error = MoyNalogError(f"Unexpected error: {e}")
+                logger.error("Unexpected error in _request", exc_info=True)
+                raise MoyNalogError(f"Unexpected error: {e}") from e
 
             if attempt < self.max_retries - 1:
                 await self._retry_delay(attempt, "Request failed", last_error)
@@ -504,13 +508,28 @@ class MoyNalogClient:
                 device_id=self._device_id,
                 token_expire_at=self._token_expire_at,
             )
-            self.session_file.write_text(
-                session.model_dump_json(indent=2),
-                encoding="utf-8",
+            payload = session.model_dump_json(indent=2)
+            fd = os.open(
+                self.session_file,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                0o600,
             )
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(payload)
+            try:  # noqa: SIM105
+                os.chmod(self.session_file, 0o600)
+            except OSError:
+                pass
             logger.debug(f"Session saved to {self.session_file}")
         except Exception as e:
             logger.warning(f"Failed to save session: {e}")
+
+    async def _save_session_async(self) -> None:
+        """Persist the session off the event loop to avoid blocking it."""
+        if not self.session_file or not self._access_token:
+            return
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._save_session)
 
     def _load_session(self) -> bool:
         """Load session from file."""
@@ -563,10 +582,13 @@ class MoyNalogClient:
 
     async def auth_by_password(self, username: str, password: str) -> UserProfile:
         """
-        Authenticate by INN/phone and password.
+        Authenticate by INN and password.
+
+        Phone-number login is not supported by this endpoint — use
+        request_sms_code() / auth_by_sms() to sign in by phone.
 
         Args:
-            username: INN (10-12 digits) or phone number
+            username: INN (10-12 digits)
             password: Password from nalog.ru
 
         Returns:
@@ -589,9 +611,10 @@ class MoyNalogClient:
         try:
             data = await self._request("POST", "/auth/lkfl", payload)
         except MoyNalogError as e:
-            if "password" in str(e).lower() or "credentials" in str(e).lower():
-                raise InvalidCredentialsError(str(e), response=e.response) from e
-            raise AuthenticationError(str(e), response=e.response) from e
+            haystack = self._error_haystack(e)
+            if "password" in haystack or "credentials" in haystack:
+                raise InvalidCredentialsError(e.message, code=e.code, response=e.response) from e
+            raise AuthenticationError(e.message, code=e.code, response=e.response) from e
 
         return await self._process_auth_result(data, "password")
 
@@ -619,9 +642,10 @@ class MoyNalogClient:
         try:
             data = await self._request("POST", "/auth/challenge/sms/start", payload, api_version="v2")
         except MoyNalogError as e:
-            if "limit" in str(e).lower() or "часто" in str(e).lower():
-                raise SMSRateLimitError(str(e), response=e.response) from e
-            raise SMSError(str(e), response=e.response) from e
+            haystack = self._error_haystack(e)
+            if "limit" in haystack or "часто" in haystack:
+                raise SMSRateLimitError(e.message, code=e.code, response=e.response) from e
+            raise SMSError(e.message, code=e.code, response=e.response) from e
 
         return SMSChallenge.model_validate(data)
 
@@ -658,9 +682,10 @@ class MoyNalogClient:
             # Note: start uses v2, but verify uses v1 (API quirk)
             data = await self._request("POST", "/auth/challenge/sms/verify", payload, api_version="v1")
         except MoyNalogError as e:
-            if "code" in str(e).lower() or "код" in str(e).lower():
-                raise InvalidSMSCodeError(str(e), response=e.response) from e
-            raise SMSError(str(e), response=e.response) from e
+            haystack = self._error_haystack(e)
+            if "code" in haystack or "код" in haystack:
+                raise InvalidSMSCodeError(e.message, code=e.code, response=e.response) from e
+            raise SMSError(e.message, code=e.code, response=e.response) from e
 
         return await self._process_auth_result(data, "SMS")
 
@@ -691,11 +716,11 @@ class MoyNalogClient:
                     self._token_expire_at = datetime.now(timezone.utc) + timedelta(hours=1)
 
             if self.session_file:
-                self._save_session()
+                await self._save_session_async()
 
             logger.debug("Access token refreshed")
             return True
-        except Exception as e:
+        except (httpx.HTTPError, MoyNalogError) as e:
             logger.warning(f"Failed to refresh token: {e}")
             return False
 
@@ -762,8 +787,8 @@ class MoyNalogClient:
         Raises:
             ReceiptError: Receipt creation failed
         """
-        if not self.is_authenticated:
-            raise AuthenticationError("Not authenticated")
+        if not self.is_authenticated or not self._inn:
+            raise AuthenticationError("Not authenticated (INN unknown)")
 
         if not items:
             raise ValidationError("Items list cannot be empty")
@@ -790,7 +815,7 @@ class MoyNalogClient:
         try:
             data = await self._request("POST", "/income", payload, with_auth=True)
         except MoyNalogError as e:
-            raise ReceiptError(str(e), code=e.code, response=e.response) from e
+            raise ReceiptError(e.message, code=e.code, response=e.response) from e
 
         receipt_uuid = data.get("approvedReceiptUuid")
         if not receipt_uuid:
@@ -850,7 +875,7 @@ class MoyNalogClient:
         try:
             data = await self._request("POST", "/cancel", payload, with_auth=True)
         except MoyNalogError as e:
-            raise ReceiptError(str(e), code=e.code, response=e.response) from e
+            raise ReceiptError(e.message, code=e.code, response=e.response) from e
 
         cancelled_uuid = data.get("approvedReceiptUuid") or receipt_uuid
 
@@ -879,6 +904,8 @@ class MoyNalogClient:
 
         try:
             return await self._request("GET", f"/receipt/{self._inn}/{receipt_uuid}/json", with_auth=True)
+        except (AuthenticationError, RateLimitError):
+            raise
         except MoyNalogError:
             return None
 
@@ -929,9 +956,13 @@ class MoyNalogClient:
 
         endpoint = f"/receipt/{self._inn}/{receipt_uuid}/{format}"
         client = await self._get_client()
+
+        if self.auto_refresh_token and self.is_token_expired and self._refresh_token:
+            await self._do_refresh_token()
         headers = self._get_headers(with_auth=True)
 
         last_error: Exception | None = None
+        refreshed_on_401 = False
 
         for attempt in range(self.max_retries):
             try:
@@ -944,6 +975,19 @@ class MoyNalogClient:
                     return response.content
                 if response.status_code == 404:
                     return None
+                if response.status_code == 401:
+                    if (
+                        not refreshed_on_401
+                        and self.auto_refresh_token
+                        and self._refresh_token
+                        and await self._do_refresh_token()
+                    ):
+                        refreshed_on_401 = True
+                        headers = self._get_headers(with_auth=True)
+                        continue
+                    raise TokenExpiredError("Access token expired")
+                if response.status_code == 429:
+                    raise RateLimitError("Rate limit exceeded")
                 last_error = NetworkError(f"HTTP {response.status_code}")
 
             except httpx.TimeoutException as e:
@@ -1054,19 +1098,16 @@ class MoyNalogClientSync:
         if self._closed:
             raise RuntimeError("Client is closed")
         if self._loop is None or self._loop.is_closed():
-            # Check if we're in an async context
             try:
                 asyncio.get_running_loop()
+            except RuntimeError:
+                self._loop = asyncio.new_event_loop()
+                self._owns_loop = True
+            else:
                 raise RuntimeError(
                     "MoyNalogClientSync cannot be used from async code. "
                     "Use MoyNalogClient instead."
                 )
-            except RuntimeError as e:
-                if "no running event loop" not in str(e):
-                    raise
-            # Create our own loop
-            self._loop = asyncio.new_event_loop()
-            self._owns_loop = True
         return self._loop
 
     def _run(self, coro: Coroutine[Any, Any, _T]) -> _T:

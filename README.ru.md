@@ -112,11 +112,11 @@ with MoyNalogClientSync(session_file="session.json") as client:
 
 ### По паролю
 
-Используйте ИНН или телефон и пароль от nalog.ru:
+Используйте ИНН и пароль от nalog.ru. Для входа по телефону используйте SMS-авторизацию:
 
 ```python
 profile = await client.auth_by_password(
-    username="123456789012",  # ИНН (12 цифр) или телефон
+    username="123456789012",  # ИНН (10-12 цифр)
     password="ваш_пароль"
 )
 print(f"Авторизован как: {profile.display_name}")
