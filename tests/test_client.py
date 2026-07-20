@@ -49,7 +49,7 @@ class TestMoyNalogClient:
     async def test_cancel_receipt_not_authenticated(self):
         async with MoyNalogClient() as client:
             with pytest.raises(AuthenticationError):
-                await client.cancel_receipt("test-uuid")
+                await client.cancel_receipt("11111111-1111-1111-1111-111111111111")
 
     async def test_get_incomes_not_authenticated(self):
         async with MoyNalogClient() as client:

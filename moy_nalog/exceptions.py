@@ -66,3 +66,8 @@ class NetworkError(MoyNalogError):
 class RateLimitError(MoyNalogError):
     """API rate limit exceeded."""
     pass
+
+
+class ServiceUnavailableError(MoyNalogError):
+    """FNS API is temporarily unavailable."""
+    pass

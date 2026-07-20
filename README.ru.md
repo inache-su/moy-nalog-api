@@ -23,9 +23,9 @@
 | **SMS-аутентификация** | Полная поддержка (запрос + подтверждение) | Часто отсутствует или сломана |
 | **Сохранение сессии** | Встроенное хранение в JSON | Требуется ручная реализация |
 | **Авто-обновление токена** | Автоматически до истечения | Требуется ручное обновление |
-| **Type hints** | 100% типизация, совместимость с mypy | Частичная или отсутствует |
+| **Type hints** | Типизированный публичный API, совместимость с mypy | Частичная или отсутствует |
 | **Pydantic v2** | Полная валидация и сериализация | Часто dict или Pydantic v1 |
-| **Современный Python** | 3.10+ с новым синтаксисом | Часто 3.7+ с устаревшим кодом |
+| **Современный Python** | 3.10+ с современным синтаксисом | Часто 3.7+ с устаревшим кодом |
 | **Обработка ошибок** | Типизированная иерархия исключений | Общие исключения |
 | **Повторные попытки** | Встроенный exponential backoff | Обычно отсутствует |
 | **Несколько позиций** | Нативная поддержка мульти-чеков | Только одна позиция |
@@ -44,7 +44,7 @@
 - Список доходов с пагинацией и фильтрацией
 - Отмена чеков с указанием причины
 - Поддержка HTTP/HTTPS и SOCKS прокси
-- Полная типизация для поддержки IDE
+- Типизированный публичный API для поддержки IDE
 
 ## Установка
 
@@ -146,24 +146,47 @@ print(f"Авторизован как: {profile.display_name}")
 
 ```python
 # Файл сессии хранит токены между запусками
-client = MoyNalogClient(session_file="session.json")
+async with MoyNalogClient(session_file="session.json") as client:
+    # Проверка, восстановлена ли предыдущая сессия
+    if client.is_authenticated:
+        print("Сессия восстановлена из файла")
+    else:
+        # Аутентификация (токены сохраняются автоматически)
+        await client.auth_by_password(username, password)
 
-# Проверка, авторизован ли клиент из предыдущей сессии
-if client.is_authenticated:
-    print("Сессия восстановлена из файла")
-else:
-    # Аутентификация (токены сохраняются автоматически)
-    await client.auth_by_password(username, password)
-
-# Токены обновляются автоматически при истечении
-# Сессия сохраняется при закрытии
+    # Токены автоматически обновляются перед истечением.
+    # Контекстный менеджер закрывает HTTP-клиент и сохраняет сессию.
 ```
 
 Файл сессии содержит:
+
 - Access token (для API-запросов)
 - Refresh token (для обновления токена)
 - Время истечения токена
 - ИНН пользователя и ID устройства
+
+Файл сессии содержит учётные данные и ИНН. На POSIX-системах он записывается с правами только
+для владельца (`0o600`); не добавляйте его в Git, не передавайте и не выводите в логи.
+
+### Управление сессией и токенами
+
+Оба клиента предоставляют свойства `is_authenticated`, `inn`, `access_token`, `refresh_token`,
+`token_expires_at`, `is_token_expired` и `device_id`. Сессией также можно управлять вручную:
+
+```python
+# Восстановить учётные данные, полученные из другого источника
+client.set_tokens(
+    access_token="access_token",
+    refresh_token="refresh_token",
+    inn="123456789012",
+)
+
+# Для MoyNalogClientSync вызов выполняется без await
+refreshed = await client.refresh_access_token()
+
+# Очистить данные в памяти и удалить session_file, если он настроен
+client.clear_session()
+```
 
 ## Создание чеков
 
@@ -276,21 +299,19 @@ receipt = await client.create_receipt(
 ## Отмена чеков
 
 Отмена чека в текущем налоговом периоде:
+Передавайте UUID, возвращённый при создании чека или получении списка доходов; при некорректном
+UUID клиент выбрасывает `ValidationError` до отправки запроса.
 
 ```python
 from moy_nalog import CancelReason
 
-# Клиент запросил возврат
+# Отменить чек, возвращённый create_receipt() или create_receipt_multi()
 await client.cancel_receipt(
-    receipt_uuid="abc123",
+    receipt_uuid=receipt.uuid,
     reason=CancelReason.REFUND
 )
 
-# Чек создан по ошибке
-await client.cancel_receipt(
-    receipt_uuid="abc123",
-    reason=CancelReason.MISTAKE
-)
+# Если чек создан ошибочно, используйте CancelReason.MISTAKE.
 ```
 
 ## Просмотр чеков
@@ -330,14 +351,17 @@ if incomes.has_more:
 
 ```python
 # Получить полные данные чека как dict
-data = await client.get_receipt("receipt_uuid")
+data = await client.get_receipt(receipt.uuid)
 if data:
     print(f"Услуги: {data['services']}")
     print(f"Тип оплаты: {data['paymentType']}")
 
 # Получить URL для печати
-url = client.get_receipt_print_url("receipt_uuid")
+url = client.get_receipt_print_url(receipt.uuid)
 ```
+
+`get_receipt()` возвращает `None` только при ответе API с HTTP 404. Ошибки авторизации, лимитов,
+техработ и другие ошибки API выбрасываются как соответствующие исключения.
 
 ### Скачивание чека
 
@@ -345,15 +369,19 @@ url = client.get_receipt_print_url("receipt_uuid")
 
 ```python
 # Скачать как JSON
-json_bytes = await client.download_receipt_raw("receipt_uuid", format="json")
-with open("receipt.json", "wb") as f:
-    f.write(json_bytes)
+json_bytes = await client.download_receipt_raw(receipt.uuid, format="json")
+if json_bytes is not None:
+    with open("receipt.json", "wb") as f:
+        f.write(json_bytes)
 
-# Скачать как PNG изображение (для печати)
-png_bytes = await client.download_receipt_raw("receipt_uuid", format="print")
-with open("receipt.png", "wb") as f:
-    f.write(png_bytes)
+# Скачать представление для печати (обычно HTML)
+print_bytes = await client.download_receipt_raw(receipt.uuid, format="print")
+if print_bytes is not None:
+    with open("receipt.html", "wb") as f:
+        f.write(print_bytes)
 ```
+
+Для `format="print"` API возвращает сырые байты; клиент не предоставляет Content-Type ответа.
 
 ## Обработка ошибок
 
@@ -370,6 +398,7 @@ from moy_nalog import (
     ValidationError,
     NetworkError,
     RateLimitError,
+    ServiceUnavailableError,
 )
 
 try:
@@ -398,11 +427,18 @@ except ReceiptError as e:
 try:
     # Сетевые ошибки повторяются автоматически
     await client.get_incomes()
+except ServiceUnavailableError as e:
+    print(f"ФНС временно недоступна: {e.message}")
 except NetworkError:
     print("Сеть недоступна после повторных попыток")
 except RateLimitError:
     print("Превышен лимит запросов API")
 ```
+
+`ServiceUnavailableError` возникает при HTTP 503 и известных ответах о временных технических
+работах. Такие ответы API не повторяются с коротким сетевым backoff. Если технические работы
+обнаружены при обновлении токена, клиент сохраняет текущие токены, а
+`refresh_access_token()` по-прежнему возвращает `False`.
 
 ## Конфигурация
 
@@ -425,6 +461,9 @@ client = MoyNalogClient(
 
     # URL прокси-сервера (опционально)
     proxy="http://proxy.example.com:8080",
+
+    # Проверять TLS-сертификаты (по умолчанию: True)
+    verify_ssl=True,
 
     # Пользовательский User-Agent (опционально)
     user_agent="MyApp/1.0",
@@ -507,15 +546,25 @@ pytest --cov=moy_nalog
 
 ### Интеграционный тест
 
-Интерактивный скрипт для тестирования всего функционала API с реальным аккаунтом.
+Интерактивный тест с реальным аккаунтом. Режим по умолчанию `auth_only` проверяет авторизацию и
+профиль без создания чеков. Опциональный режим `full` проверяет операции с чеками.
+
+**Внимание:** режим `full` создаёт настоящие чеки в налоговом аккаунте. Скрипт всегда пытается
+выполнить очистку, но из-за сетевой ошибки, техработ ФНС или остановки процесса чеки могут остаться
+активными. После каждого полного запуска проверьте результат в личном кабинете.
 
 ```bash
 python scripts/integration_test.py
 ```
 
-**Что тестируется:**
-- Аутентификация по паролю и SMS
-- Сохранение сессии (сохранение/восстановление токенов)
+**Режим `auth_only` по умолчанию:**
+
+- Один выбранный способ авторизации: пароль с ИНН или телефон с SMS
+- Получение профиля пользователя
+- Сохранение сессии при авторизации по паролю
+
+**Дополнительные проверки в режиме `full`:**
+
 - Создание простого чека (1 позиция, наличные)
 - Мульти-чек (3 позиции с количеством)
 - Чек с информацией о физлице
@@ -523,19 +572,22 @@ python scripts/integration_test.py
 - Чек с безналичной оплатой (WIRE)
 - Получение списка доходов с пагинацией
 - Получение данных чека по UUID
-- Отмена чека
+- Скачивание чеков в JSON и печатном HTML-представлении
+- Попытка отмены каждого созданного чека
 
 **Как работает:**
+
 1. Выберите метод аутентификации (пароль или SMS)
-2. Введите учётные данные
-3. Скрипт выполняет все тесты последовательно
-4. Все созданные чеки отменяются автоматически
+2. Выберите режим теста (`auth_only` используется по умолчанию)
+3. Введите ИНН и пароль либо телефон и код из SMS
+4. В полном режиме скрипт проверяет чеки и пытается выполнить очистку в блоке `finally`
 5. Подробный лог и JSON-отчёт сохраняются в директорию `test_output/`
 
 **Результаты:**
+
 - `test_output/<timestamp>/test_log_*.log` - подробный лог выполнения
 - `test_output/<timestamp>/test_report_*.json` - JSON-отчёт с результатами
-- `test_output/<timestamp>/receipts/` - скачанные файлы чеков (JSON/HTML)
+- `test_output/<timestamp>/receipts/` - скачанные в полном режиме файлы чеков (JSON/HTML)
 
 ## Требования
 
@@ -551,7 +603,7 @@ python scripts/integration_test.py
 
 ## Автор
 
-Kirill Nikulin (c) 2025 [kirodev.eu](https://kirodev.eu)
+Kirill Nikulin (c) 2025-2026 [kirodev.eu](https://kirodev.eu)
 
 ## Лицензия
 

@@ -34,6 +34,7 @@ from .exceptions import (
     NetworkError,
     RateLimitError,
     ReceiptError,
+    ServiceUnavailableError,
     SMSError,
     SMSRateLimitError,
     TokenExpiredError,
@@ -51,7 +52,7 @@ from .models import (
     UserProfile,
 )
 
-__version__ = "1.0.5"
+__version__ = "1.0.6"
 __author__ = "Kirill Nikulin"
 __email__ = "me@kirodev.eu"
 
@@ -85,4 +86,5 @@ __all__ = [
     "ValidationError",
     "NetworkError",
     "RateLimitError",
+    "ServiceUnavailableError",
 ]

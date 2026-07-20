@@ -38,6 +38,7 @@ htmlcov/
 test_output/
 
 # Misc
+.audit/
 *.log
 Thumbs.db
 uv.lock

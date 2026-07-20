@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "moy-nalog-api"
-version = "1.0.5"
+version = "1.0.6"
 description = "The most complete async Python client for Russian self-employed tax service (Moy Nalog / lknpd.nalog.ru)"
 readme = "README.md"
 license = "MIT"
@@ -66,6 +66,16 @@ Documentation = "https://github.com/inache-su/moy-nalog-api#readme"
 Repository = "https://github.com/inache-su/moy-nalog-api"
 Issues = "https://github.com/inache-su/moy-nalog-api/issues"
 Changelog = "https://github.com/inache-su/moy-nalog-api/blob/main/CHANGELOG.md"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/CHANGELOG.md",
+    "/README.ru.md",
+    "/examples",
+    "/moy_nalog",
+    "/scripts",
+    "/tests",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["moy_nalog"]

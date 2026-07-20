@@ -17,6 +17,7 @@ from decimal import Decimal
 from pathlib import Path
 from types import TracebackType
 from typing import Any, TypeVar
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -30,6 +31,7 @@ from .exceptions import (
     NetworkError,
     RateLimitError,
     ReceiptError,
+    ServiceUnavailableError,
     SMSError,
     SMSRateLimitError,
     TokenExpiredError,
@@ -49,6 +51,10 @@ from .models import (
 logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
+
+
+class _ResourceNotFoundError(MoyNalogError):
+    """Internal marker for an HTTP 404 response."""
 
 
 class MoyNalogClient:
@@ -255,6 +261,24 @@ class MoyNalogClient:
         return f"{error.message} {error.code or ''}".lower()
 
     @staticmethod
+    def _is_service_unavailable_response(
+        status_code: int,
+        message: str,
+        code: str | None,
+    ) -> bool:
+        """Classify temporary FNS outages without parsing maintenance schedules."""
+        if status_code == 503:
+            return True
+        haystack = f"{message} {code or ''}".lower()
+        return (
+            ("техническ" in haystack and "работ" in haystack)
+            or "maintenance" in haystack
+            or "service unavailable" in haystack
+            or "service_unavailable" in haystack
+            or "временно недоступ" in haystack
+        )
+
+    @staticmethod
     def _validate_receipt_uuid(value: str) -> str:
         """Validate receipt UUID format.
 
@@ -268,8 +292,10 @@ class MoyNalogClient:
             ValidationError: If UUID format is invalid
         """
         value = value.strip()
-        if not value:
-            raise ValidationError("Receipt UUID cannot be empty")
+        try:
+            UUID(value)
+        except (AttributeError, ValueError) as e:
+            raise ValidationError("Receipt UUID must be a valid UUID") from e
         return value
 
     async def _retry_delay(self, attempt: int, context: str, error: Exception | None) -> None:
@@ -420,6 +446,7 @@ class MoyNalogClient:
         with_auth: bool = False,
         api_version: str = "v1",
         _allow_retry_on_401: bool = True,
+        _allow_not_found: bool = False,
     ) -> dict[str, Any]:
         """
         Make HTTP request with retry logic.
@@ -472,6 +499,22 @@ class MoyNalogClient:
                 if response.status_code >= 400:
                     error_msg = data.get("message") or data.get("exceptionMessage") or f"HTTP {response.status_code}"
                     error_code = data.get("code")
+                    if self._is_service_unavailable_response(
+                        response.status_code,
+                        error_msg,
+                        error_code,
+                    ):
+                        raise ServiceUnavailableError(
+                            error_msg,
+                            code=error_code,
+                            response=data,
+                        )
+                    if response.status_code == 404 and _allow_not_found:
+                        raise _ResourceNotFoundError(
+                            error_msg,
+                            code=error_code,
+                            response=data,
+                        )
                     raise MoyNalogError(error_msg, code=error_code, response=data)
 
                 return data
@@ -610,6 +653,8 @@ class MoyNalogClient:
 
         try:
             data = await self._request("POST", "/auth/lkfl", payload)
+        except ServiceUnavailableError:
+            raise
         except MoyNalogError as e:
             haystack = self._error_haystack(e)
             if "password" in haystack or "credentials" in haystack:
@@ -641,6 +686,8 @@ class MoyNalogClient:
 
         try:
             data = await self._request("POST", "/auth/challenge/sms/start", payload, api_version="v2")
+        except ServiceUnavailableError:
+            raise
         except MoyNalogError as e:
             haystack = self._error_haystack(e)
             if "limit" in haystack or "часто" in haystack:
@@ -681,6 +728,8 @@ class MoyNalogClient:
         try:
             # Note: start uses v2, but verify uses v1 (API quirk)
             data = await self._request("POST", "/auth/challenge/sms/verify", payload, api_version="v1")
+        except ServiceUnavailableError:
+            raise
         except MoyNalogError as e:
             haystack = self._error_haystack(e)
             if "code" in haystack or "код" in haystack:
@@ -720,6 +769,12 @@ class MoyNalogClient:
 
             logger.debug("Access token refreshed")
             return True
+        except ServiceUnavailableError as e:
+            logger.warning(
+                "Token refresh skipped because FNS is temporarily unavailable: %s",
+                e,
+            )
+            return False
         except (httpx.HTTPError, MoyNalogError) as e:
             logger.warning(f"Failed to refresh token: {e}")
             return False
@@ -814,6 +869,8 @@ class MoyNalogClient:
 
         try:
             data = await self._request("POST", "/income", payload, with_auth=True)
+        except ServiceUnavailableError:
+            raise
         except MoyNalogError as e:
             raise ReceiptError(e.message, code=e.code, response=e.response) from e
 
@@ -874,6 +931,8 @@ class MoyNalogClient:
 
         try:
             data = await self._request("POST", "/cancel", payload, with_auth=True)
+        except ServiceUnavailableError:
+            raise
         except MoyNalogError as e:
             raise ReceiptError(e.message, code=e.code, response=e.response) from e
 
@@ -895,7 +954,12 @@ class MoyNalogClient:
             receipt_uuid: Receipt UUID
 
         Returns:
-            Receipt data dict or None
+            Receipt data dict, or None when the receipt is not found
+
+        Raises:
+            AuthenticationError: If not authenticated
+            ValidationError: If receipt_uuid is invalid
+            MoyNalogError: On other API failures
         """
         if not self.is_authenticated or not self._inn:
             raise AuthenticationError("Not authenticated")
@@ -903,10 +967,13 @@ class MoyNalogClient:
         receipt_uuid = self._validate_receipt_uuid(receipt_uuid)
 
         try:
-            return await self._request("GET", f"/receipt/{self._inn}/{receipt_uuid}/json", with_auth=True)
-        except (AuthenticationError, RateLimitError):
-            raise
-        except MoyNalogError:
+            return await self._request(
+                "GET",
+                f"/receipt/{self._inn}/{receipt_uuid}/json",
+                with_auth=True,
+                _allow_not_found=True,
+            )
+        except _ResourceNotFoundError:
             return None
 
     def get_receipt_print_url(self, receipt_uuid: str) -> str:
@@ -988,6 +1055,29 @@ class MoyNalogClient:
                     raise TokenExpiredError("Access token expired")
                 if response.status_code == 429:
                     raise RateLimitError("Rate limit exceeded")
+                if response.status_code >= 400:
+                    data: dict[str, Any] = {}
+                    if response.text:
+                        try:  # noqa: SIM105
+                            data = response.json()
+                        except json.JSONDecodeError:
+                            pass
+                    error_msg = (
+                        data.get("message")
+                        or data.get("exceptionMessage")
+                        or f"HTTP {response.status_code}"
+                    )
+                    error_code = data.get("code")
+                    if self._is_service_unavailable_response(
+                        response.status_code,
+                        error_msg,
+                        error_code,
+                    ):
+                        raise ServiceUnavailableError(
+                            error_msg,
+                            code=error_code,
+                            response=data,
+                        )
                 last_error = NetworkError(f"HTTP {response.status_code}")
 
             except httpx.TimeoutException as e:

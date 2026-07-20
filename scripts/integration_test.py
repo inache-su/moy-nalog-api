@@ -2,15 +2,16 @@
 """
 Interactive integration test for Moy Nalog API client.
 
-This script tests all major functionality:
-- Password and SMS authentication
+This script can test the major client functionality:
+- Password or SMS authentication (one method per run)
 - Creating various types of receipts
-- Downloading receipt files (PDF/JSON)
+- Downloading receipt files (JSON/printable HTML)
 - Querying income list
 - Canceling receipts
 - Session persistence
 
-All created receipts are cancelled at the end.
+The default mode only tests authentication and profile retrieval. Full mode
+creates real receipts and attempts to cancel every created receipt during cleanup.
 A detailed log file is generated.
 
 Usage:
@@ -36,6 +37,7 @@ from moy_nalog import (
     PaymentType,
     ReceiptError,
     ServiceItem,
+    ServiceUnavailableError,
     SMSError,
 )
 
@@ -115,10 +117,10 @@ class IntegrationTest:
                 json_path.write_bytes(json_content)
                 self.logger.debug(f"Saved JSON: {json_path}")
 
-            # Download printable version using public API
+            # The print endpoint returns raw printable content, normally HTML.
             print_content = await client.download_receipt_raw(receipt_uuid, "print")
             if print_content:
-                # Default to .html extension since we don't have content-type info
+                # Use .html because the API does not expose content-type metadata here.
                 print_path = self.receipts_dir / f"{receipt_uuid}.html"
                 print_path.write_bytes(print_content)
                 self.logger.debug(f"Saved printable: {print_path}")
@@ -476,6 +478,7 @@ class IntegrationTest:
             return True
 
         all_cancelled = True
+        cancelled_count = 0
 
         for receipt_uuid in self.created_receipts:
             try:
@@ -489,8 +492,9 @@ class IntegrationTest:
                     True,
                     "Reason: MISTAKE"
                 )
+                cancelled_count += 1
 
-            except ReceiptError as e:
+            except (ReceiptError, ServiceUnavailableError) as e:
                 self.log_test(
                     f"Cancel receipt {receipt_uuid[:12]}...",
                     False,
@@ -498,7 +502,9 @@ class IntegrationTest:
                 )
                 all_cancelled = False
 
-        self.logger.info(f"\nCancelled {len(self.created_receipts)} receipts")
+        self.logger.info(
+            f"\nCleanup result: {cancelled_count}/{len(self.created_receipts)} receipts cancelled"
+        )
         return all_cancelled
 
     async def test_session_persistence(
@@ -605,7 +611,7 @@ class IntegrationTest:
 
         Args:
             auth_method: "password" or "sms"
-            username: INN or phone for password auth
+            username: INN for password auth
             password: Password for password auth
             phone: Phone number for SMS auth
             proxy: Proxy URL (optional)
@@ -642,19 +648,20 @@ class IntegrationTest:
 
             # Full test mode: receipts
             if test_mode == "full":
-                # Receipt creation tests
-                await self.test_simple_receipt(client)
-                await self.test_multi_item_receipt(client)
-                await self.test_receipt_with_individual_client(client)
-                await self.test_receipt_with_legal_entity(client)
-                await self.test_receipt_bank_transfer(client)
+                try:
+                    # Receipt creation tests
+                    await self.test_simple_receipt(client)
+                    await self.test_multi_item_receipt(client)
+                    await self.test_receipt_with_individual_client(client)
+                    await self.test_receipt_with_legal_entity(client)
+                    await self.test_receipt_bank_transfer(client)
 
-                # Query tests
-                await self.test_get_incomes(client)
-                await self.test_get_receipt_data(client)
-
-                # Cleanup - cancel all test receipts
-                await self.test_cancel_receipts(client)
+                    # Query tests
+                    await self.test_get_incomes(client)
+                    await self.test_get_receipt_data(client)
+                finally:
+                    # Always attempt cleanup, including after an unexpected failure.
+                    await self.test_cancel_receipts(client)
             else:
                 self.logger.info("\n" + "-" * 40)
                 self.logger.info("Skipping receipt tests (auth_only mode)")
@@ -759,6 +766,7 @@ def get_test_mode() -> str:
     print("-" * 40)
     print("  1. Auth only - test authentication and profile")
     print("  2. Full test - auth + create/cancel receipts")
+    print("     WARNING: full mode creates real receipts in the tax account")
     print("-" * 40)
 
     while True:
@@ -792,11 +800,11 @@ def get_auth_choice() -> dict:
         print("\n" + "-" * 40)
         print("Password Authentication")
         print("-" * 40)
-        username = input("Username (INN or phone): ").strip()
+        username = input("INN: ").strip()
         password = getpass.getpass("Password: ")
 
         if not username or not password:
-            print("Error: Username and password are required")
+            print("Error: INN and password are required")
             sys.exit(1)
 
         return {

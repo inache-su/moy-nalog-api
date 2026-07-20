@@ -1,6 +1,7 @@
 """Tests for token handling, session storage, and error propagation."""
 
 import json
+import logging
 import os
 import stat
 from datetime import datetime, timedelta, timezone
@@ -15,7 +16,9 @@ from moy_nalog import (
     MoyNalogClient,
     MoyNalogClientSync,
     RateLimitError,
+    ServiceUnavailableError,
     TokenExpiredError,
+    ValidationError,
 )
 from moy_nalog.exceptions import MoyNalogError, SMSError, SMSRateLimitError
 
@@ -33,6 +36,9 @@ class FakeResponse:
 
 def _future() -> datetime:
     return datetime.now(timezone.utc) + timedelta(hours=1)
+
+
+VALID_RECEIPT_UUID = "11111111-1111-1111-1111-111111111111"
 
 
 def _attach_http(client: MoyNalogClient, **mock_kwargs) -> MagicMock:
@@ -107,20 +113,45 @@ class TestGetReceiptErrorHandling:
             client.set_tokens("t", "r", "123456789012")
             client._request = AsyncMock(side_effect=RateLimitError("rate limited"))
             with pytest.raises(RateLimitError):
-                await client.get_receipt("11111111-1111-1111-1111-111111111111")
+                await client.get_receipt(VALID_RECEIPT_UUID)
 
     async def test_reraises_token_expired(self):
         async with MoyNalogClient() as client:
             client.set_tokens("t", "r", "123456789012")
             client._request = AsyncMock(side_effect=TokenExpiredError("expired"))
             with pytest.raises(TokenExpiredError):
-                await client.get_receipt("11111111-1111-1111-1111-111111111111")
+                await client.get_receipt(VALID_RECEIPT_UUID)
 
-    async def test_returns_none_on_generic_error(self):
+    async def test_returns_none_on_404(self):
+        async with MoyNalogClient() as client:
+            client.set_tokens("t", "r", "123456789012", expire_at=_future())
+            _attach_http(
+                client,
+                get=AsyncMock(return_value=FakeResponse(404, {"message": "Not found"})),
+            )
+
+            assert await client.get_receipt(VALID_RECEIPT_UUID) is None
+
+    async def test_reraises_generic_api_error(self):
         async with MoyNalogClient() as client:
             client.set_tokens("t", "r", "123456789012")
-            client._request = AsyncMock(side_effect=MoyNalogError("not found", code="404"))
-            assert await client.get_receipt("11111111-1111-1111-1111-111111111111") is None
+            client._request = AsyncMock(side_effect=MoyNalogError("server error"))
+
+            with pytest.raises(MoyNalogError, match="server error"):
+                await client.get_receipt(VALID_RECEIPT_UUID)
+
+
+class TestReceiptUuidValidation:
+    @pytest.mark.parametrize("value", ["", "   ", "abc123", "receipt-uuid"])
+    def test_rejects_invalid_uuid(self, value):
+        with pytest.raises(ValidationError, match="valid UUID"):
+            MoyNalogClient._validate_receipt_uuid(value)
+
+    def test_accepts_and_trims_valid_uuid(self):
+        assert (
+            MoyNalogClient._validate_receipt_uuid(f"  {VALID_RECEIPT_UUID}  ")
+            == VALID_RECEIPT_UUID
+        )
 
 
 class TestAuthErrorClassification:
@@ -183,8 +214,130 @@ class TestRefreshTokenErrorHandling:
             client._request = AsyncMock(side_effect=MoyNalogError("server error"))
             assert await client._do_refresh_token() is False
 
+    async def test_service_unavailable_preserves_tokens_and_returns_false(self, caplog):
+        expire_at = _future()
+        async with MoyNalogClient() as client:
+            client.set_tokens("access", "refresh", "123456789012", expire_at=expire_at)
+            client._request = AsyncMock(
+                side_effect=ServiceUnavailableError(
+                    "Выполняются технические работы с 23:00 МСК до 02:00 МСК"
+                )
+            )
+
+            with caplog.at_level(logging.WARNING, logger="moy_nalog.client"):
+                assert await client.refresh_access_token() is False
+
+            assert client.access_token == "access"
+            assert client.refresh_token == "refresh"
+            assert client.token_expires_at == expire_at
+            assert "FNS is temporarily unavailable" in caplog.text
+            assert "Failed to refresh token" not in caplog.text
+
+
+class TestServiceUnavailableHandling:
+    async def test_503_is_typed_and_not_retried(self):
+        async with MoyNalogClient(max_retries=3) as client:
+            http = _attach_http(
+                client,
+                get=AsyncMock(return_value=FakeResponse(503, {"message": "Try later"})),
+            )
+
+            with pytest.raises(ServiceUnavailableError) as exc_info:
+                await client._request("GET", "/x")
+
+            assert exc_info.value.message == "Try later"
+            assert http.get.await_count == 1
+
+    async def test_maintenance_message_is_typed_when_status_is_not_503(self):
+        message = "Выполняются технические работы с 23:00 МСК до 02:00 МСК"
+        async with MoyNalogClient() as client:
+            _attach_http(
+                client,
+                get=AsyncMock(return_value=FakeResponse(500, {"message": message})),
+            )
+
+            with pytest.raises(ServiceUnavailableError) as exc_info:
+                await client._request("GET", "/x")
+
+            assert exc_info.value.message == message
+
+    async def test_service_unavailable_code_is_typed(self):
+        async with MoyNalogClient() as client:
+            _attach_http(
+                client,
+                get=AsyncMock(
+                    return_value=FakeResponse(
+                        500,
+                        {"message": "Try later", "code": "service_unavailable"},
+                    )
+                ),
+            )
+
+            with pytest.raises(ServiceUnavailableError) as exc_info:
+                await client._request("GET", "/x")
+
+            assert exc_info.value.code == "service_unavailable"
+
+    async def test_unrelated_server_error_remains_generic(self):
+        async with MoyNalogClient() as client:
+            _attach_http(
+                client,
+                get=AsyncMock(return_value=FakeResponse(500, {"message": "Internal error"})),
+            )
+
+            with pytest.raises(MoyNalogError) as exc_info:
+                await client._request("GET", "/x")
+
+            assert type(exc_info.value) is MoyNalogError
+
+    @pytest.mark.parametrize(
+        ("method_name", "args"),
+        [
+            ("auth_by_password", ("123456789012", "password")),
+            ("request_sms_code", ("79001234567",)),
+            ("auth_by_sms", ("79001234567", "challenge", "123456")),
+            ("create_receipt", ("Service", Decimal("100"))),
+            ("cancel_receipt", (VALID_RECEIPT_UUID,)),
+            ("get_receipt", (VALID_RECEIPT_UUID,)),
+        ],
+    )
+    async def test_public_operations_preserve_typed_error(self, method_name, args):
+        async with MoyNalogClient() as client:
+            client.set_tokens("access", "refresh", "123456789012", expire_at=_future())
+            client._request = AsyncMock(
+                side_effect=ServiceUnavailableError("FNS is temporarily unavailable")
+            )
+
+            with pytest.raises(ServiceUnavailableError):
+                await getattr(client, method_name)(*args)
+
+    async def test_raw_receipt_download_raises_without_retry(self):
+        async with MoyNalogClient(max_retries=3) as client:
+            client.set_tokens("access", "refresh", "123456789012", expire_at=_future())
+            http = _attach_http(
+                client,
+                get=AsyncMock(return_value=FakeResponse(503, {"message": "Try later"})),
+            )
+
+            with pytest.raises(ServiceUnavailableError):
+                await client.download_receipt_raw(VALID_RECEIPT_UUID)
+
+            assert http.get.await_count == 1
+
 
 class TestRequestRetry:
+    async def test_404_remains_generic_without_not_found_opt_in(self):
+        async with MoyNalogClient() as client:
+            _attach_http(
+                client,
+                get=AsyncMock(return_value=FakeResponse(404, {"message": "Not found"})),
+            )
+
+            with pytest.raises(MoyNalogError) as exc_info:
+                await client._request("GET", "/x")
+
+            assert type(exc_info.value) is MoyNalogError
+
     async def test_401_refreshes_and_retries_in_loop(self):
         async with MoyNalogClient() as client:
             client.set_tokens("t", "refresh", "123456789012", expire_at=_future())
@@ -225,14 +378,14 @@ class TestDownloadReceiptRaw:
             client.set_tokens("t", "refresh", "123456789012", expire_at=_future())
             _attach_http(client, get=AsyncMock(return_value=FakeResponse(429)))
             with pytest.raises(RateLimitError):
-                await client.download_receipt_raw("11111111-1111-1111-1111-111111111111")
+                await client.download_receipt_raw(VALID_RECEIPT_UUID)
 
     async def test_raises_token_expired_when_refresh_unavailable(self):
         async with MoyNalogClient() as client:
             client.set_tokens("t", inn="123456789012", expire_at=_future())
             _attach_http(client, get=AsyncMock(return_value=FakeResponse(401)))
             with pytest.raises(TokenExpiredError):
-                await client.download_receipt_raw("11111111-1111-1111-1111-111111111111")
+                await client.download_receipt_raw(VALID_RECEIPT_UUID)
 
     async def test_refreshes_and_returns_content_on_retry(self):
         async with MoyNalogClient() as client:
@@ -242,7 +395,7 @@ class TestDownloadReceiptRaw:
                 client,
                 get=AsyncMock(side_effect=[FakeResponse(401), FakeResponse(200, content=b"PDF")]),
             )
-            result = await client.download_receipt_raw("11111111-1111-1111-1111-111111111111")
+            result = await client.download_receipt_raw(VALID_RECEIPT_UUID)
             assert result == b"PDF"
             client._do_refresh_token.assert_awaited_once()
 
@@ -250,7 +403,7 @@ class TestDownloadReceiptRaw:
         async with MoyNalogClient() as client:
             client.set_tokens("t", "refresh", "123456789012", expire_at=_future())
             _attach_http(client, get=AsyncMock(return_value=FakeResponse(404)))
-            assert await client.download_receipt_raw("11111111-1111-1111-1111-111111111111") is None
+            assert await client.download_receipt_raw(VALID_RECEIPT_UUID) is None
 
 
 class TestSyncLoopGuard:

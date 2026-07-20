@@ -23,9 +23,9 @@ There are several Python libraries for the Moy Nalog API. Here's why you should 
 | **SMS authentication** | Full support (request + verify) | Often missing or broken |
 | **Session persistence** | Built-in JSON file storage | Manual implementation required |
 | **Auto token refresh** | Automatic before expiration | Manual refresh needed |
-| **Type hints** | 100% typed, mypy-compatible | Partial or none |
+| **Type hints** | Typed public API, mypy-compatible | Partial or none |
 | **Pydantic v2** | Full validation and serialization | Often dict-based or Pydantic v1 |
-| **Modern Python** | 3.10+ with latest syntax | Often 3.7+ with legacy code |
+| **Modern Python** | 3.10+ with modern syntax | Often 3.7+ with legacy code |
 | **Error handling** | Typed exception hierarchy | Generic exceptions |
 | **Retry logic** | Exponential backoff built-in | Usually none |
 | **Multiple items** | Native support for multi-item receipts | Single item only |
@@ -44,7 +44,7 @@ There are several Python libraries for the Moy Nalog API. Here's why you should 
 - Income list with pagination and filtering
 - Receipt cancellation with reason
 - HTTP/HTTPS and SOCKS proxy support
-- Complete type hints for IDE support
+- Typed public API for IDE support
 
 ## Installation
 
@@ -146,24 +146,47 @@ Save and restore authentication tokens automatically:
 
 ```python
 # Session file stores tokens between runs
-client = MoyNalogClient(session_file="session.json")
+async with MoyNalogClient(session_file="session.json") as client:
+    # Check if already authenticated from a previous session
+    if client.is_authenticated:
+        print("Session restored from file")
+    else:
+        # Authenticate (tokens are saved automatically)
+        await client.auth_by_password(username, password)
 
-# Check if already authenticated from previous session
-if client.is_authenticated:
-    print("Session restored from file")
-else:
-    # Authenticate (tokens saved automatically)
-    await client.auth_by_password(username, password)
-
-# Tokens auto-refresh when expired
-# Session auto-saves on close
+    # Tokens refresh automatically near expiration.
+    # The context manager closes the HTTP client and saves the session.
 ```
 
 Session file contains:
+
 - Access token (for API requests)
 - Refresh token (for token renewal)
 - Token expiration time
 - User INN and device ID
+
+Session files contain credentials and an INN. On POSIX systems they are written with owner-only
+permissions (`0o600`); do not commit, share, or log them.
+
+### Session and Token Management
+
+Both async and sync clients expose `is_authenticated`, `inn`, `access_token`, `refresh_token`,
+`token_expires_at`, `is_token_expired`, and `device_id`. Sessions can also be managed manually:
+
+```python
+# Restore credentials obtained elsewhere
+client.set_tokens(
+    access_token="access_token",
+    refresh_token="refresh_token",
+    inn="123456789012",
+)
+
+# Async client; omit await when using MoyNalogClientSync
+refreshed = await client.refresh_access_token()
+
+# Forget in-memory credentials and delete session_file, if configured
+client.clear_session()
+```
 
 ## Creating Receipts
 
@@ -276,21 +299,19 @@ receipt = await client.create_receipt(
 ## Canceling Receipts
 
 Cancel a receipt within the same tax period:
+Pass the UUID returned by a receipt creation or income-list operation; malformed UUIDs raise
+`ValidationError` before a request is sent.
 
 ```python
 from moy_nalog import CancelReason
 
-# Client requested refund
+# Cancel the receipt returned by create_receipt() or create_receipt_multi()
 await client.cancel_receipt(
-    receipt_uuid="abc123",
+    receipt_uuid=receipt.uuid,
     reason=CancelReason.REFUND
 )
 
-# Receipt created by mistake
-await client.cancel_receipt(
-    receipt_uuid="abc123",
-    reason=CancelReason.MISTAKE
-)
+# Use CancelReason.MISTAKE instead when the receipt was created by mistake.
 ```
 
 ## Viewing Receipts
@@ -330,14 +351,17 @@ if incomes.has_more:
 
 ```python
 # Get full receipt data as dict
-data = await client.get_receipt("receipt_uuid")
+data = await client.get_receipt(receipt.uuid)
 if data:
     print(f"Services: {data['services']}")
     print(f"Payment type: {data['paymentType']}")
 
 # Get printable URL
-url = client.get_receipt_print_url("receipt_uuid")
+url = client.get_receipt_print_url(receipt.uuid)
 ```
+
+`get_receipt()` returns `None` only when the API responds with HTTP 404. Authentication,
+rate-limit, maintenance, and other API failures raise their corresponding exception.
 
 ### Download Receipt
 
@@ -345,15 +369,19 @@ Download receipt as raw bytes for saving or processing:
 
 ```python
 # Download as JSON
-json_bytes = await client.download_receipt_raw("receipt_uuid", format="json")
-with open("receipt.json", "wb") as f:
-    f.write(json_bytes)
+json_bytes = await client.download_receipt_raw(receipt.uuid, format="json")
+if json_bytes is not None:
+    with open("receipt.json", "wb") as f:
+        f.write(json_bytes)
 
-# Download as PNG image (for printing)
-png_bytes = await client.download_receipt_raw("receipt_uuid", format="print")
-with open("receipt.png", "wb") as f:
-    f.write(png_bytes)
+# Download the printable representation (normally HTML)
+print_bytes = await client.download_receipt_raw(receipt.uuid, format="print")
+if print_bytes is not None:
+    with open("receipt.html", "wb") as f:
+        f.write(print_bytes)
 ```
+
+The API returns raw bytes for `format="print"`; the client does not expose a response Content-Type.
 
 ## Error Handling
 
@@ -370,6 +398,7 @@ from moy_nalog import (
     ValidationError,
     NetworkError,
     RateLimitError,
+    ServiceUnavailableError,
 )
 
 try:
@@ -398,11 +427,18 @@ except ReceiptError as e:
 try:
     # Network issues are retried automatically
     await client.get_incomes()
+except ServiceUnavailableError as e:
+    print(f"FNS is temporarily unavailable: {e.message}")
 except NetworkError:
     print("Network unavailable after retries")
 except RateLimitError:
     print("API rate limit exceeded")
 ```
+
+`ServiceUnavailableError` is raised for HTTP 503 and known temporary-maintenance responses.
+These API responses are not retried with the short network backoff. If maintenance is reported
+during token refresh, the client keeps the current tokens and `refresh_access_token()` returns
+`False` as before.
 
 ## Configuration
 
@@ -425,6 +461,9 @@ client = MoyNalogClient(
 
     # Proxy server URL (optional)
     proxy="http://proxy.example.com:8080",
+
+    # Verify TLS certificates (default: True)
+    verify_ssl=True,
 
     # Custom User-Agent header (optional)
     user_agent="MyApp/1.0",
@@ -507,15 +546,25 @@ pytest --cov=moy_nalog
 
 ### Integration Test
 
-Interactive script for testing all API functionality with a real account.
+Interactive live-account test. Its default `auth_only` mode checks authentication and the user
+profile without creating receipts. The optional `full` mode exercises receipt operations.
+
+**Warning:** Full mode creates real receipts in the tax account. Cleanup is always attempted, but
+network failures, FNS maintenance, or process termination can leave receipts active. Verify the
+result in the personal cabinet after every full run.
 
 ```bash
 python scripts/integration_test.py
 ```
 
-**What it tests:**
-- Password and SMS authentication
-- Session persistence (save/restore tokens)
+**Default `auth_only` mode:**
+
+- One selected authentication flow: password with INN, or phone with SMS
+- User profile retrieval
+- Session persistence for password authentication
+
+**Additional checks in `full` mode:**
+
 - Simple receipt creation (1 item, cash payment)
 - Multi-item receipt (3 items with quantities)
 - Receipt with individual client info
@@ -523,19 +572,22 @@ python scripts/integration_test.py
 - Receipt with bank transfer payment (WIRE)
 - Income list retrieval with pagination
 - Receipt data retrieval by UUID
-- Receipt cancellation
+- Receipt downloads in JSON and printable HTML form
+- Best-effort cancellation of every created receipt
 
 **How it works:**
+
 1. Choose authentication method (password or SMS)
-2. Enter credentials
-3. Script runs all tests sequentially
-4. All created receipts are cancelled automatically
-5. Detailed log and JSON report are saved to `test_output/` directory
+2. Choose test mode (`auth_only` is the default)
+3. Enter the INN and password, or the phone number and SMS code
+4. In full mode, the script runs receipt tests and attempts cleanup in a `finally` block
+5. Detailed log and JSON report are saved to the `test_output/` directory
 
 **Output:**
+
 - `test_output/<timestamp>/test_log_*.log` - detailed execution log
 - `test_output/<timestamp>/test_report_*.json` - JSON report with results
-- `test_output/<timestamp>/receipts/` - downloaded receipt files (JSON/HTML)
+- `test_output/<timestamp>/receipts/` - downloaded receipt files in full mode (JSON/HTML)
 
 ## Requirements
 
@@ -551,7 +603,7 @@ Always verify receipts in your personal cabinet at [lknpd.nalog.ru](https://lknp
 
 ## Author
 
-Kirill Nikulin (c) 2025 [kirodev.eu](https://kirodev.eu)
+Kirill Nikulin (c) 2025-2026 [kirodev.eu](https://kirodev.eu)
 
 ## License
 

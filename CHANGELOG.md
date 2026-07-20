@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [1.0.6] - 2026-07-20
+
+### Added
+- Added public `ServiceUnavailableError` for HTTP 503 responses and known temporary FNS maintenance responses
+
+### Changed
+- Token refresh now logs planned service unavailability separately, preserves the current session tokens, and keeps the existing `False` return value
+- Temporary service-unavailability responses are not retried with the short network backoff
+
+### Fixed
+- Receipt identifiers are now validated as UUIDs before receipt requests are sent
+- `get_receipt()` now returns `None` only for HTTP 404; other API failures propagate as typed exceptions
+- The live integration tester now requests an INN for password authentication and always attempts receipt cleanup in full mode
+- Source distributions no longer include checkout-local tooling, reports, or the untracked Conda recipe
+
+### Documentation
+- Corrected the printable receipt format, documented session/token management, and clarified the integration test modes and real-account side effects in both READMEs
+
+> Note: callers that relied on `get_receipt()` returning `None` for non-404 API failures must now handle the corresponding exception.
+
 ## [1.0.5] - 2026-05-30
 
 ### Security
@@ -12,7 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - `download_receipt_raw()` now refreshes the token on a `401` and raises `RateLimitError` on `429`, instead of silently returning `None` when the access token has expired
-- `get_receipt()` no longer hides `RateLimitError`, `TokenExpiredError`, and `AuthenticationError` behind a `None` result — these are re-raised; only a genuinely missing receipt returns `None`
+- `get_receipt()` no longer hides `RateLimitError`, `TokenExpiredError`, and `AuthenticationError` behind a `None` result; other API errors still return `None` in this release
 - `create_receipt()` / `create_receipt_multi()` raise `AuthenticationError` when the INN is unknown instead of building receipt URLs containing `None`
 - Authentication errors are classified by the API message and error code rather than the formatted exception string, avoiding false keyword matches
 
@@ -40,7 +62,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Improved sync client cleanup with `__del__` method and `_closed` flag to prevent resource leaks
-- Better error handling: safe JSON parsing, UUID validation for receipt IDs
+- Better error handling: safe JSON parsing and rejection of empty receipt IDs
 - Internal refactoring: extracted `_normalize_phone`, `_parse_datetime`, `_validate_receipt_uuid` helper methods
 
 ## [1.0.3] - 2025-12-26
