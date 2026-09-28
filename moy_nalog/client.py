@@ -5,6 +5,7 @@ The most complete and modern Python client for Russian self-employed tax service
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -21,6 +22,7 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 import httpx
+from pydantic import ValidationError as ModelValidationError
 
 from .enums import CancelReason, PaymentType
 from .exceptions import (
@@ -108,6 +110,7 @@ class MoyNalogClient:
         proxy: str | None = None,
         verify_ssl: bool = True,
         user_agent: str | None = None,
+        strict_api_errors: bool = False,
     ) -> None:
         """
         Initialize the API client.
@@ -127,6 +130,9 @@ class MoyNalogClient:
             verify_ssl: Verify SSL certificates (default: True).
                    Set to False when using proxy servers that intercept SSL traffic.
             user_agent: Custom User-Agent header (optional).
+            strict_api_errors: Opt into strict response validation and specific
+                creation/download errors. False keeps the 1.0.6 download/income
+                fallbacks and creation-error wrappers.
         """
         self.timezone = timezone
         self.timeout = timeout
@@ -136,6 +142,7 @@ class MoyNalogClient:
         self.proxy = proxy
         self.verify_ssl = verify_ssl
         self.user_agent = user_agent or self.DEFAULT_USER_AGENT
+        self.strict_api_errors = strict_api_errors
 
         self._device_id = self._generate_device_id()
         self._access_token: str | None = None
@@ -143,6 +150,7 @@ class MoyNalogClient:
         self._token_expire_at: datetime | None = None
         self._inn: str | None = None
         self._client: httpx.AsyncClient | None = None
+        self._refresh_task: asyncio.Task[bool] | None = None
 
         if self.session_file:
             self._load_session()
@@ -213,6 +221,8 @@ class MoyNalogClient:
 
     async def close(self) -> None:
         """Close HTTP client and save session."""
+        if self._refresh_task is not None and not self._refresh_task.done():
+            await asyncio.shield(self._refresh_task)
         if self._client:
             await self._client.aclose()
             self._client = None
@@ -281,6 +291,32 @@ class MoyNalogClient:
         )
 
     @staticmethod
+    def _response_data(response: httpx.Response) -> dict[str, Any]:
+        """Read a JSON object, leaving malformed bodies for endpoint validation."""
+        try:
+            data = response.json()
+        except ValueError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    @classmethod
+    def _response_error(cls, response: httpx.Response, data: dict[str, Any]) -> MoyNalogError:
+        """Classify HTTP errors shared by JSON requests and raw downloads."""
+        message = data.get("message") or data.get("exceptionMessage")
+        if not isinstance(message, str) or not message:
+            message = f"HTTP {response.status_code}"
+        code = data.get("code")
+        if not isinstance(code, str):
+            code = None
+        if response.status_code == 401:
+            return TokenExpiredError("Access token expired", code=code, response=data)
+        if response.status_code == 429:
+            return RateLimitError("Rate limit exceeded", code=code, response=data)
+        if cls._is_service_unavailable_response(response.status_code, message, code):
+            return ServiceUnavailableError(message, code=code, response=data)
+        return MoyNalogError(message, code=code, response=data)
+
+    @staticmethod
     def _validate_receipt_uuid(value: str) -> str:
         """Validate a 10-character FNS receipt ID or a legacy UUID.
 
@@ -322,11 +358,12 @@ class MoyNalogClient:
     async def _process_auth_result(self, data: dict[str, Any], method: str) -> UserProfile:
         """Store tokens from auth response and return profile."""
         result = AuthResult.model_validate(data)
+        profile = result.profile or UserProfile.model_validate(data.get("profile", {}))
+
         self._access_token = result.access_token
         self._refresh_token = result.refresh_token
         self._token_expire_at = result.token_expire_in
 
-        profile = result.profile or UserProfile.model_validate(data.get("profile", {}))
         self._inn = profile.inn
 
         if self.session_file:
@@ -371,34 +408,18 @@ class MoyNalogClient:
     @staticmethod
     def _encode_proxy_url(proxy_url: str) -> str:
         """URL-encode username and password in proxy URL if needed."""
-        from urllib.parse import quote, urlparse, urlunparse
+        from urllib.parse import quote_from_bytes, unquote_to_bytes, urlparse
 
         parsed = urlparse(proxy_url)
 
-        if not parsed.username:
+        if parsed.username is None:
             return proxy_url
 
-        encoded_username = quote(parsed.username, safe="")
-        encoded_password = quote(parsed.password or "", safe="") if parsed.password else ""
-
-        if encoded_password:
-            credentials = f"{encoded_username}:{encoded_password}"
-        else:
-            credentials = encoded_username
-
-        if parsed.port:
-            netloc = f"{credentials}@{parsed.hostname}:{parsed.port}"
-        else:
-            netloc = f"{credentials}@{parsed.hostname}"
-
-        return urlunparse((
-            parsed.scheme,
-            netloc,
-            parsed.path,
-            parsed.params,
-            parsed.query,
-            parsed.fragment,
-        ))
+        credentials = quote_from_bytes(unquote_to_bytes(parsed.username), safe="")
+        if parsed.password is not None:
+            credentials += ":" + quote_from_bytes(unquote_to_bytes(parsed.password), safe="")
+        authority = parsed.netloc.rsplit("@", 1)[-1]
+        return parsed._replace(netloc=f"{credentials}@{authority}").geturl()
 
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create HTTP client."""
@@ -428,6 +449,7 @@ class MoyNalogClient:
                     client_kwargs["transport"] = transport
                 else:
                     # HTTP/HTTPS proxy - native httpx support
+                    proxy_arg = "proxy" if "proxy" in inspect.signature(httpx.AsyncClient).parameters else "proxies"
                     # ssl_context is only needed for https:// proxy connections
                     is_https_proxy = encoded_proxy.lower().startswith("https://")
                     if not self.verify_ssl and is_https_proxy:
@@ -436,12 +458,12 @@ class MoyNalogClient:
                         ssl_context = ssl.create_default_context()
                         ssl_context.check_hostname = False
                         ssl_context.verify_mode = ssl.CERT_NONE
-                        client_kwargs["proxy"] = httpx.Proxy(
+                        client_kwargs[proxy_arg] = httpx.Proxy(
                             url=encoded_proxy,
                             ssl_context=ssl_context,
                         )
                     else:
-                        client_kwargs["proxy"] = encoded_proxy
+                        client_kwargs[proxy_arg] = encoded_proxy
 
             self._client = httpx.AsyncClient(**client_kwargs)
         return self._client
@@ -475,64 +497,53 @@ class MoyNalogClient:
         refreshed_on_401 = False
         creating_receipt = method == "POST" and endpoint == "/income"
 
-        for attempt in range(self.max_retries):
+        attempt = 0
+        while attempt < self.max_retries:
             try:
                 if method == "GET":
                     response = await client.get(url, headers=headers, params=payload)
                 else:
                     response = await client.post(url, headers=headers, json=payload)
 
-                data: dict[str, Any] = {}
-                if response.text:
-                    try:  # noqa: SIM105
-                        data = response.json()
-                    except json.JSONDecodeError:
-                        pass
+                data = self._response_data(response)
 
-                if response.status_code == 401:
+                if (
+                    response.status_code == 401
+                    and with_auth
+                    and _allow_retry_on_401
+                    and not refreshed_on_401
+                    and self.auto_refresh_token
+                    and self._refresh_token
+                ):
+                    logger.debug("Got 401, attempting token refresh and retry")
                     if (
-                        with_auth
-                        and _allow_retry_on_401
-                        and not refreshed_on_401
-                        and self.auto_refresh_token
-                        and self._refresh_token
+                        headers.get("Authorization") != self._get_headers(True).get("Authorization")
+                        or await self._do_refresh_token()
                     ):
-                        logger.debug("Got 401, attempting token refresh and retry")
-                        if await self._do_refresh_token():
-                            refreshed_on_401 = True
-                            headers = self._get_headers(with_auth)
-                            continue
-                    raise TokenExpiredError("Access token expired", response=data)
-                if response.status_code == 429:
-                    raise RateLimitError("Rate limit exceeded", response=data)
+                        refreshed_on_401 = True
+                        headers = self._get_headers(with_auth)
+                        continue
                 if response.status_code >= 400:
-                    error_msg = data.get("message") or data.get("exceptionMessage") or f"HTTP {response.status_code}"
-                    error_code = data.get("code")
-                    if creating_receipt and error_code == "receipt.duplication":
+                    error = self._response_error(response, data)
+                    if isinstance(error, (TokenExpiredError, RateLimitError)):
+                        raise error
+                    if creating_receipt and error.code == "receipt.duplication":
                         raise DuplicateReceiptError(
-                            error_msg, code=error_code, response=data, payload=payload or {},
+                            error.message, code=error.code, response=data, payload=payload or {},
                         )
-                    if self._is_service_unavailable_response(
-                        response.status_code,
-                        error_msg,
-                        error_code,
-                    ):
-                        raise ServiceUnavailableError(
-                            error_msg,
-                            code=error_code,
-                            response=data,
-                        )
+                    if isinstance(error, ServiceUnavailableError):
+                        raise error
                     if response.status_code == 404 and _allow_not_found:
                         raise _ResourceNotFoundError(
-                            error_msg,
-                            code=error_code,
+                            error.message,
+                            code=error.code,
                             response=data,
                         )
                     if creating_receipt and response.status_code >= 500:
                         raise ReceiptCreationUnknownError(
-                            error_msg, code=error_code, response=data, payload=payload or {},
+                            error.message, code=error.code, response=data, payload=payload or {},
                         )
-                    raise MoyNalogError(error_msg, code=error_code, response=data)
+                    raise error
 
                 return data
 
@@ -544,7 +555,6 @@ class MoyNalogClient:
                 if (
                     creating_receipt
                     and last_error is not None
-                    and e.code != "receipt.duplication"
                     and not isinstance(e, ReceiptCreationUnknownError)
                 ):
                     raise ReceiptCreationUnknownError(
@@ -563,6 +573,7 @@ class MoyNalogClient:
 
             if attempt < self.max_retries - 1:
                 await self._retry_delay(attempt, "Request failed", last_error)
+            attempt += 1
 
         if last_error is not None:
             raise last_error
@@ -771,9 +782,16 @@ class MoyNalogClient:
         return await self._process_auth_result(data, "SMS")
 
     async def _do_refresh_token(self) -> bool:
+        """Share an in-flight refresh without cancelling it when one caller leaves."""
+        if self._refresh_task is None or self._refresh_task.done():
+            self._refresh_task = asyncio.create_task(self._refresh_tokens())
+        return await asyncio.shield(self._refresh_task)
+
+    async def _refresh_tokens(self) -> bool:
         """Refresh access token using refresh token."""
         if not self._refresh_token:
             return False
+        session = (self._access_token, self._refresh_token, self._inn)
 
         payload = {
             "deviceInfo": self._get_device_info(),
@@ -782,6 +800,8 @@ class MoyNalogClient:
 
         try:
             data = await self._request("POST", "/auth/token", payload)
+            if session != (self._access_token, self._refresh_token, self._inn):
+                return False
             new_token = data.get("token")
             if not new_token:
                 logger.warning("Token refresh response missing 'token' field")
@@ -906,8 +926,12 @@ class MoyNalogClient:
 
         try:
             data = await self._request("POST", "/income", payload, with_auth=True)
-        except (ReceiptCreationUnknownError, AuthenticationError, RateLimitError, ServiceUnavailableError):
+        except (ReceiptCreationUnknownError, ServiceUnavailableError):
             raise
+        except (AuthenticationError, RateLimitError) as e:
+            if self.strict_api_errors:
+                raise
+            raise ReceiptError(e.message, code=e.code, response=e.response) from e
         except NetworkError as e:
             raise ReceiptCreationUnknownError(
                 "Receipt creation response was not received; reconcile before submitting again",
@@ -977,7 +1001,12 @@ class MoyNalogClient:
         candidates: dict[str, Receipt] = {}
         offset = 0
         while True:
-            incomes = await self.get_incomes(from_date=date, to_date=date, offset=offset)
+            try:
+                incomes = await self.get_incomes(from_date=date, to_date=date, offset=offset)
+            except ModelValidationError as e:
+                raise MoyNalogError("Invalid income list response") from e
+            if "items" not in incomes.model_fields_set:
+                raise MoyNalogError("Invalid income list response: expected a content list")
             for receipt in incomes.items:
                 if (
                     receipt.is_cancelled
@@ -1050,10 +1079,15 @@ class MoyNalogClient:
 
         cancelled_uuid = data.get("approvedReceiptUuid") or receipt_uuid
 
-        receipt = Receipt(
-            uuid=cancelled_uuid,
-            total_amount=Decimal("0"),
-        )
+        receipt = Receipt.model_validate({
+            "totalAmount": "0",
+            **data,
+            "approvedReceiptUuid": cancelled_uuid,
+            "cancellationInfo": data.get("cancellationInfo") or {
+                "operationTime": op_time,
+                "comment": reason.value,
+            },
+        })
 
         logger.info(f"Receipt cancelled: {cancelled_uuid}")
         return receipt
@@ -1119,11 +1153,12 @@ class MoyNalogClient:
             format: Output format - "json" or "print" (default: "json")
 
         Returns:
-            Raw bytes of receipt data, or None if not found
+            Raw bytes, or None on HTTP 404 or exhausted network/server retries
 
         Raises:
             AuthenticationError: If not authenticated
             ValidationError: If format is invalid
+            MoyNalogError: On non-retryable API failures
         """
         if not self.is_authenticated or not self._inn:
             raise AuthenticationError("Not authenticated")
@@ -1143,7 +1178,8 @@ class MoyNalogClient:
         last_error: Exception | None = None
         refreshed_on_401 = False
 
-        for attempt in range(self.max_retries):
+        attempt = 0
+        while attempt < self.max_retries:
             try:
                 response = await client.get(
                     f"{self.API_URL_V1}{endpoint}",
@@ -1154,42 +1190,25 @@ class MoyNalogClient:
                     return response.content
                 if response.status_code == 404:
                     return None
-                if response.status_code == 401:
-                    if (
-                        not refreshed_on_401
-                        and self.auto_refresh_token
-                        and self._refresh_token
-                        and await self._do_refresh_token()
-                    ):
-                        refreshed_on_401 = True
-                        headers = self._get_headers(with_auth=True)
-                        continue
-                    raise TokenExpiredError("Access token expired")
-                if response.status_code == 429:
-                    raise RateLimitError("Rate limit exceeded")
-                if response.status_code >= 400:
-                    data: dict[str, Any] = {}
-                    if response.text:
-                        try:  # noqa: SIM105
-                            data = response.json()
-                        except json.JSONDecodeError:
-                            pass
-                    error_msg = (
-                        data.get("message")
-                        or data.get("exceptionMessage")
-                        or f"HTTP {response.status_code}"
+                if (
+                    response.status_code == 401
+                    and not refreshed_on_401
+                    and self.auto_refresh_token
+                    and self._refresh_token
+                    and (
+                        headers.get("Authorization") != self._get_headers(True).get("Authorization")
+                        or await self._do_refresh_token()
                     )
-                    error_code = data.get("code")
-                    if self._is_service_unavailable_response(
-                        response.status_code,
-                        error_msg,
-                        error_code,
-                    ):
-                        raise ServiceUnavailableError(
-                            error_msg,
-                            code=error_code,
-                            response=data,
-                        )
+                ):
+                    refreshed_on_401 = True
+                    headers = self._get_headers(with_auth=True)
+                    continue
+                if response.status_code >= 400:
+                    error = self._response_error(response, self._response_data(response))
+                    if response.status_code < 500 or isinstance(error, ServiceUnavailableError):
+                        if type(error) is MoyNalogError and not self.strict_api_errors:
+                            return None
+                        raise error
                 last_error = NetworkError(f"HTTP {response.status_code}")
 
             except httpx.TimeoutException as e:
@@ -1199,6 +1218,7 @@ class MoyNalogClient:
 
             if attempt < self.max_retries - 1:
                 await self._retry_delay(attempt, "Download receipt failed", last_error)
+            attempt += 1
 
         logger.warning(f"Failed to download receipt {receipt_uuid} after {self.max_retries} attempts: {last_error}")
         return None
@@ -1241,7 +1261,15 @@ class MoyNalogClient:
             params["to"] = to_date.strftime("%Y-%m-%dT23:59:59.999Z")
 
         data = await self._request("GET", "/incomes", params, with_auth=True)
-        return IncomeList.model_validate(data)
+        try:
+            incomes = IncomeList.model_validate(data)
+        except ModelValidationError as e:
+            if not self.strict_api_errors:
+                raise
+            raise MoyNalogError("Invalid income list response", response=data) from e
+        if self.strict_api_errors and "items" not in incomes.model_fields_set:
+            raise MoyNalogError("Invalid income list response: expected a content list", response=data)
+        return incomes
 
     # ==================== USER ====================
 

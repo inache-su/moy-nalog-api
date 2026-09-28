@@ -1,5 +1,6 @@
 """Tests for token handling, session storage, and error propagation."""
 
+import asyncio
 import json
 import logging
 import os
@@ -10,9 +11,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
+from pydantic import ValidationError as ModelValidationError
 
 from moy_nalog import (
     AuthenticationError,
+    CancelReason,
     DuplicateReceiptError,
     InvalidCredentialsError,
     MoyNalogClient,
@@ -520,7 +523,7 @@ class TestReceiptCreationOutcome:
             if lost_response and error_type is not DuplicateReceiptError
             else error_type
         )
-        async with MoyNalogClient() as client:
+        async with MoyNalogClient(strict_api_errors=True) as client:
             client.set_tokens("test", inn="test-account")
             client._retry_delay = AsyncMock()
             http = _attach_http(client, post=AsyncMock(side_effect=responses))
@@ -654,3 +657,327 @@ class TestFNSReceiptIdentifiers:
                 client.get_receipt_print_url(value)
             client._request.assert_not_awaited()
             client._get_client.assert_not_awaited()
+
+
+class TestAuditRegressions:
+    @pytest.mark.parametrize("download", [False, True])
+    async def test_401_replay_still_stops_after_one_refresh(self, download):
+        async with MoyNalogClient(max_retries=1, strict_api_errors=True) as client:
+            client.set_tokens("old-access", "refresh", "test-account", expire_at=_future())
+            http = _attach_http(
+                client,
+                get=AsyncMock(return_value=FakeResponse(401)),
+                post=AsyncMock(return_value=FakeResponse(200, {"token": "new-access"})),
+            )
+            with pytest.raises(TokenExpiredError):
+                if download:
+                    await client.download_receipt_raw("abcd123456")
+                else:
+                    await client.get_receipt("abcd123456")
+            assert http.get.await_count == 2
+            assert http.post.await_count == 1
+
+    @pytest.mark.parametrize("operation", ["get", "download", "create"])
+    @pytest.mark.parametrize("prior_timeout", [False, True])
+    async def test_401_replay_has_its_own_budget(self, operation, prior_timeout):
+        requests = []
+        refreshes = []
+
+        def handle(request):
+            if request.url.path.endswith("/auth/token"):
+                refreshes.append(request)
+                return httpx.Response(200, json={"token": "new-access"})
+            requests.append(request)
+            if prior_timeout and len(requests) == 1:
+                raise httpx.ReadTimeout("Response lost", request=request)
+            if request.headers["Authorization"] == "Bearer old-access":
+                return httpx.Response(401)
+            return httpx.Response(200, json={"approvedReceiptUuid": "abcd123456"})
+
+        async with MoyNalogClient(max_retries=1 + int(prior_timeout)) as client:
+            client.set_tokens("old-access", "refresh", "test-account", expire_at=_future())
+            client._client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+            client._retry_delay = AsyncMock()
+            if operation == "download":
+                assert await client.download_receipt_raw("abcd123456")
+            elif operation == "create":
+                assert (await client.create_receipt("Service", 100)).uuid == "abcd123456"
+                assert len({request.content for request in requests}) == 1
+            else:
+                assert await client.get_receipt("abcd123456")
+            assert len(requests) == 2 + int(prior_timeout)
+            assert len(refreshes) == 1
+            assert client._retry_delay.await_count == int(prior_timeout)
+
+    @pytest.mark.parametrize("download", [False, True])
+    @pytest.mark.parametrize("status", [400, 401, 403, 405, 422, 429, 503])
+    @pytest.mark.parametrize("body", ["not JSON", "[]", "null", '{"message": [], "code": {}}'])
+    async def test_http_errors_keep_their_type_with_malformed_bodies(self, download, status, body):
+        expected = {
+            401: TokenExpiredError, 429: RateLimitError, 503: ServiceUnavailableError,
+        }.get(status, MoyNalogError)
+        async with MoyNalogClient(strict_api_errors=True) as client:
+            client.set_tokens("test", inn="test-account")
+            client._retry_delay = AsyncMock()
+            http = _attach_http(client, get=AsyncMock(return_value=httpx.Response(status, text=body)))
+            with pytest.raises(expected) as exc_info:
+                if download:
+                    await client.download_receipt_raw("abcd123456")
+                else:
+                    await client.get_receipt("abcd123456")
+            assert type(exc_info.value) is expected
+            assert http.get.await_count == 1
+            client._retry_delay.assert_not_awaited()
+
+    async def test_download_keeps_bounded_server_retries_and_api_details(self):
+        async with MoyNalogClient(max_retries=2, strict_api_errors=True) as client:
+            client.set_tokens("test", inn="test-account")
+            client._retry_delay = AsyncMock()
+            http = _attach_http(client, get=AsyncMock(return_value=FakeResponse(502)))
+            assert await client.download_receipt_raw("abcd123456") is None
+            assert http.get.await_count == 2
+            client._retry_delay.assert_awaited_once()
+            data = {"exceptionMessage": "Forbidden", "code": "receipt.forbidden"}
+            http.get = AsyncMock(return_value=FakeResponse(403, data))
+            with pytest.raises(MoyNalogError) as exc_info:
+                await client.download_receipt_raw("abcd123456")
+            assert exc_info.value.message == "Forbidden"
+            assert exc_info.value.code == "receipt.forbidden"
+            assert exc_info.value.response == data
+
+    @pytest.mark.parametrize(("proxy", "expected"), [
+        ("http://user:p@ss@proxy.test:8080", "http://user:p%40ss@proxy.test:8080"),
+        ("http://u%40:p%25%2F@proxy.test", "http://u%40:p%25%2F@proxy.test"),
+        ("socks5://user:p%40ss@[::1]:1080", "socks5://user:p%40ss@[::1]:1080"),
+        ("http://user:@[::1]:8080", "http://user:@[::1]:8080"),
+        ("http://:pass@[::1]", "http://:pass@[::1]"),
+        ("http://user@[::1]", "http://user@[::1]"),
+        ("http://[::1]:8080", "http://[::1]:8080"),
+        ("http://user:p%zz@proxy.test", "http://user:p%25zz@proxy.test"),
+    ])
+    def test_proxy_credentials_are_encoded_once(self, proxy, expected):
+        encoded = MoyNalogClient._encode_proxy_url(proxy)
+        assert encoded == expected
+        assert MoyNalogClient._encode_proxy_url(encoded) == expected
+
+    @pytest.mark.parametrize("body", [
+        "", "not JSON", "[]", "null", "{}", '{"content": null}', '{"content": {}}',
+        '{"content": [{"approvedReceiptUuid": "abcd123456"}]}',
+    ])
+    @pytest.mark.parametrize("lookup", [False, True])
+    async def test_malformed_incomes_cannot_become_no_matches(self, body, lookup):
+        payload = {
+            "operationTime": "2026-09-28T12:00:00Z", "totalAmount": "100",
+            "services": [{"name": "Service", "amount": "100", "quantity": 1}],
+            "paymentType": "CASH", "client": {"incomeType": "FROM_INDIVIDUAL"},
+        }
+        async with MoyNalogClient(strict_api_errors=not lookup) as client:
+            client.set_tokens("test", inn="test-account")
+            http = _attach_http(client, get=AsyncMock(return_value=httpx.Response(200, text=body)))
+            with pytest.raises(MoyNalogError, match="Invalid income list response"):
+                if lookup:
+                    await client.find_receipt_candidates(payload)
+                else:
+                    await client.get_incomes()
+            assert http.get.await_count == 1
+
+    @pytest.mark.parametrize("key", ["content", "items"])
+    async def test_explicit_empty_income_list_is_valid(self, key):
+        async with MoyNalogClient() as client:
+            client.set_tokens("test", inn="test-account")
+            _attach_http(client, get=AsyncMock(return_value=FakeResponse(200, {key: []})))
+            incomes = await client.get_incomes()
+            assert incomes.items == []
+            assert not incomes.has_more
+
+    @pytest.mark.parametrize("with_metadata", [False, True])
+    async def test_cancelled_receipt_retains_status_and_server_fields(self, with_metadata):
+        operation_time = datetime(2026, 9, 28, 12, tzinfo=timezone.utc)
+        metadata = {"registerTime": "2026-09-28T12:01:00Z", "comment": "Server reason"}
+        data = {"approvedReceiptUuid": "abcd123456", "totalAmount": "125.50", "name": "Service"}
+        if with_metadata:
+            data["cancellationInfo"] = metadata
+        async with MoyNalogClient() as client:
+            client.set_tokens("test", inn="test-account")
+            client._request = AsyncMock(return_value=data)
+            receipt = await client.cancel_receipt("abcd123456", CancelReason.MISTAKE, operation_time)
+            assert receipt.is_cancelled
+            assert receipt.total_amount == Decimal("125.50")
+            assert receipt.name == "Service"
+            if with_metadata:
+                assert receipt.cancellation_info.comment == "Server reason"
+                assert receipt.cancellation_info.register_time.minute == 1
+                assert receipt.cancellation_info.operation_time is None
+            else:
+                assert receipt.cancellation_info.comment == CancelReason.MISTAKE.value
+                assert receipt.cancellation_info.operation_time == operation_time
+                assert receipt.cancellation_info.register_time is None
+
+    @pytest.mark.parametrize("profile", [{}, {"profile": None}, {"profile": {}}])
+    @pytest.mark.parametrize("existing_session", [False, True])
+    @pytest.mark.parametrize("sms", [False, True])
+    async def test_invalid_auth_response_keeps_session_unchanged(self, tmp_path, profile, existing_session, sms):
+        client = MoyNalogClient(session_file=tmp_path / "session.json")
+        if existing_session:
+            client.set_tokens("old-access", "old-refresh", "test-account", expire_at=_future())
+        before = (client.access_token, client.refresh_token, client.inn, client.token_expires_at)
+        client._request = AsyncMock(return_value={
+            "token": "new-access", "refreshToken": "new-refresh", **profile,
+        })
+        client._save_session_async = AsyncMock()
+        with pytest.raises(ModelValidationError):
+            if sms:
+                await client.auth_by_sms("70000000000", "challenge", "000000")
+            else:
+                await client.auth_by_password("test-account", "test-password")
+        assert (client.access_token, client.refresh_token, client.inn, client.token_expires_at) == before
+        client._save_session_async.assert_not_awaited()
+
+    @pytest.mark.parametrize("mode", ["proactive", "401", "late-401", "explicit", "failed"])
+    async def test_parallel_operations_share_one_refresh(self, tmp_path, mode):
+        refresh_started = asyncio.Event()
+        allow_refresh = asyncio.Event()
+        both_requests_started = asyncio.Event()
+        refresh_finished = asyncio.Event()
+        refresh_payloads = []
+        old_requests = []
+
+        async def handle(request):
+            if request.url.path.endswith("/auth/token"):
+                refresh_payloads.append(json.loads(request.content))
+                refresh_started.set()
+                await allow_refresh.wait()
+                if mode == "failed":
+                    return httpx.Response(503)
+                return httpx.Response(200, json={"token": "new-access", "refreshToken": "rotated"})
+            if mode in ("401", "late-401") and request.headers["Authorization"] == "Bearer old-access":
+                old_requests.append(request)
+                if len(old_requests) == 2:
+                    both_requests_started.set()
+                    if mode == "late-401":
+                        await refresh_finished.wait()
+                else:
+                    await both_requests_started.wait()
+                return httpx.Response(401)
+            if mode != "failed":
+                assert request.headers["Authorization"] == "Bearer new-access"
+            return httpx.Response(200, json={"ok": True})
+
+        async with MoyNalogClient(session_file=tmp_path / "session.json") as client:
+            client.set_tokens(
+                "old-access", "refresh", "test-account",
+                expire_at=None if mode in ("proactive", "failed") else _future(),
+            )
+            client._client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+            client._save_session_async = AsyncMock(side_effect=refresh_finished.set)
+            if mode == "explicit":
+                operations = [client.refresh_access_token(), client.refresh_access_token()]
+            else:
+                operations = [client.get_receipt("abcd123456"), client.download_receipt_raw("abcd123456")]
+            pending = asyncio.gather(*operations)
+            await asyncio.wait_for(refresh_started.wait(), timeout=2)
+            allow_refresh.set()
+            results = await asyncio.wait_for(pending, timeout=2)
+            assert all(results)
+            assert len(refresh_payloads) == 1
+            assert refresh_payloads[0]["refreshToken"] == "refresh"
+            assert client._save_session_async.await_count == (0 if mode == "failed" else 1)
+
+    async def test_cancelled_waiter_does_not_cancel_shared_refresh(self):
+        started = asyncio.Event()
+        finish = asyncio.Event()
+
+        async def refresh(*args, **kwargs):
+            started.set()
+            await finish.wait()
+            return {"token": "new-access"}
+
+        async with MoyNalogClient() as client:
+            client.set_tokens("old-access", "refresh", "test-account")
+            client._request = AsyncMock(side_effect=refresh)
+            cancelled = asyncio.create_task(client.refresh_access_token())
+            await asyncio.wait_for(started.wait(), timeout=2)
+            other = asyncio.create_task(client.refresh_access_token())
+            cancelled.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await cancelled
+            finish.set()
+            assert await asyncio.wait_for(other, timeout=2)
+            assert client.access_token == "new-access"
+            client._request.assert_awaited_once()
+
+    def test_sync_adapter_preserves_corrected_results_and_errors(self):
+        with MoyNalogClientSync(max_retries=1, strict_api_errors=True) as client:
+            client.set_tokens("old-access", "refresh", "test-account", expire_at=_future())
+            http = _attach_http(
+                client._client,
+                get=AsyncMock(side_effect=[FakeResponse(401), FakeResponse(200, {"ok": True})]),
+                post=AsyncMock(return_value=FakeResponse(200, {"token": "new-access"})),
+            )
+            assert client.get_receipt("abcd123456") == {"ok": True}
+            assert client.access_token == "new-access"
+            http.post = AsyncMock(return_value=FakeResponse(200, {}))
+            assert client.cancel_receipt("abcd123456").is_cancelled
+            http.get = AsyncMock(return_value=FakeResponse(403))
+            with pytest.raises(MoyNalogError):
+                client.download_receipt_raw("abcd123456")
+            http.get = AsyncMock(return_value=FakeResponse(200, {}))
+            with pytest.raises(MoyNalogError, match="Invalid income list response"):
+                client.get_incomes()
+
+
+class TestReleaseCompatibility:
+    @pytest.mark.parametrize("strict", [False, True])
+    @pytest.mark.parametrize(("status", "specific_error"), [(401, TokenExpiredError), (429, RateLimitError)])
+    async def test_creation_keeps_legacy_error_handlers_by_default(self, strict, status, specific_error):
+        async with MoyNalogClient(strict_api_errors=strict) as client:
+            client.set_tokens("test", inn="test-account")
+            _attach_http(client, post=AsyncMock(return_value=FakeResponse(status)))
+            expected = specific_error if strict else ReceiptError
+            with pytest.raises(expected) as exc_info:
+                await client.create_receipt("Service", 100)
+            assert type(exc_info.value) is expected
+
+    def test_sync_defaults_keep_legacy_download_and_income_results(self):
+        with MoyNalogClientSync() as client:
+            client.set_tokens("test", inn="test-account")
+            http = _attach_http(client._client, get=AsyncMock(return_value=FakeResponse(403)))
+            client._client._retry_delay = AsyncMock()
+            assert client.download_receipt_raw("abcd123456") is None
+            assert http.get.await_count == 1
+            client._client._retry_delay.assert_not_awaited()
+            http.get = AsyncMock(return_value=FakeResponse(200, {}))
+            assert client.get_incomes().items == []
+            http.get = AsyncMock(return_value=FakeResponse(200, {"content": None}))
+            with pytest.raises(ModelValidationError):
+                client.get_incomes()
+
+    @pytest.mark.parametrize("proxy", [None, "http://user:p%40ss@[::1]:8080", "https://proxy.example.test:8080"])
+    async def test_transport_construction_on_supported_httpx_versions(self, proxy):
+        async with MoyNalogClient(proxy=proxy) as client:
+            transport = await client._get_client()
+            assert not transport.is_closed
+        assert transport.is_closed
+
+    @pytest.mark.parametrize("replace_session", [False, True])
+    async def test_in_flight_refresh_cannot_restore_or_replace_a_new_session(self, replace_session):
+        started = asyncio.Event()
+        finish = asyncio.Event()
+
+        async def refresh(*args, **kwargs):
+            started.set()
+            await finish.wait()
+            return {"token": "stale-access", "refreshToken": "stale-refresh"}
+
+        async with MoyNalogClient() as client:
+            client.set_tokens("old-access", "old-refresh", "old-account")
+            client._request = AsyncMock(side_effect=refresh)
+            pending = asyncio.create_task(client.refresh_access_token())
+            await asyncio.wait_for(started.wait(), timeout=2)
+            client.clear_session()
+            if replace_session:
+                client.set_tokens("new-access", "new-refresh", "new-account")
+            finish.set()
+            assert not await asyncio.wait_for(pending, timeout=2)
+            assert client.access_token == ("new-access" if replace_session else None)
+            assert client.inn == ("new-account" if replace_session else None)

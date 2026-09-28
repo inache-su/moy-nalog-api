@@ -1,451 +1,324 @@
-# moy-nalog-api
+<p align="center">
+  <img
+    src="https://raw.githubusercontent.com/inache-su/moy-nalog-api/main/assets/readme/hero-en.svg"
+    width="100%"
+    alt="moy-nalog-api — typed async and sync Python access to authentication, sessions, and receipt operations for lknpd.nalog.ru"
+  >
+</p>
 
-[![GitHub](https://img.shields.io/badge/GitHub-inache--su%2Fmoy--nalog--api-181717?logo=github)](https://github.com/inache-su/moy-nalog-api)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![PyPI version](https://badge.fury.io/py/moy-nalog-api.svg)](https://pypi.org/project/moy-nalog-api/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
+<p align="center">
+  <a href="https://pypi.org/project/moy-nalog-api/"><img src="https://img.shields.io/pypi/v/moy-nalog-api?label=PyPI&color=EF5A5A" alt="PyPI version"></a>
+  <a href="https://pypi.org/project/moy-nalog-api/"><img src="https://img.shields.io/pypi/pyversions/moy-nalog-api?color=3776AB" alt="Supported Python versions"></a>
+  <a href="https://github.com/inache-su/moy-nalog-api/blob/main/LICENSE"><img src="https://img.shields.io/github/license/inache-su/moy-nalog-api?color=0D1117" alt="MIT license"></a>
+  <img src="https://img.shields.io/badge/typed-Pydantic%20v2-EF5A5A" alt="Typed with Pydantic v2">
+</p>
 
-**The most complete and modern Python client for Russian self-employed tax service (lknpd.nalog.ru).**
+<p align="center">
+  <a href="https://github.com/inache-su/moy-nalog-api/blob/main/README.ru.md">Русская версия</a>
+  ·
+  <a href="https://pypi.org/project/moy-nalog-api/">PyPI</a>
+  ·
+  <a href="https://github.com/inache-su/moy-nalog-api/blob/main/CHANGELOG.md">Changelog</a>
+  ·
+  <a href="https://github.com/inache-su/moy-nalog-api/tree/main/examples">Examples</a>
+</p>
 
-Unofficial Python client for "Moy Nalog" API (self-employed, NPD tax regime).
+`moy-nalog-api` is an unofficial Python client for the Russian self-employed tax service at
+`lknpd.nalog.ru`. It keeps authentication, token refresh, session persistence, transport retries,
+and receipt models behind one typed async API, with a matching synchronous adapter.
 
-[Документация на русском](https://github.com/inache-su/moy-nalog-api/blob/main/README.ru.md)
+> **Unofficial client.** This project is not affiliated with the Federal Tax Service of Russia.
+> The private API can change without notice. Always verify registered and cancelled receipts in the
+> [personal cabinet](https://lknpd.nalog.ru).
 
-## Why moy-nalog-api?
-
-There are several Python libraries for the Moy Nalog API. Here's why you should choose this one:
-
-| Feature | moy-nalog-api | Others |
-|---------|---------------|--------|
-| **Async/await support** | Native httpx async | Often sync-only or requests-based |
-| **Sync wrapper included** | Yes, for non-async code | Usually one or the other |
-| **SMS authentication** | Full support (request + verify) | Often missing or broken |
-| **Session persistence** | Built-in JSON file storage | Manual implementation required |
-| **Auto token refresh** | Automatic before expiration | Manual refresh needed |
-| **Type hints** | Typed public API, mypy-compatible | Partial or none |
-| **Pydantic v2** | Full validation and serialization | Often dict-based or Pydantic v1 |
-| **Modern Python** | 3.10+ with modern syntax | Often 3.7+ with legacy code |
-| **Error handling** | Typed exception hierarchy | Generic exceptions |
-| **Retry logic** | Exponential backoff built-in | Usually none |
-| **Multiple items** | Native support for multi-item receipts | Single item only |
-| **Proxy support** | HTTP, HTTPS, SOCKS4/5 | Often none |
-| **Documentation** | Comprehensive with examples | Often minimal |
-
-## Features
-
-- Async (httpx) and sync client support
-- Password and SMS authentication
-- Automatic token refresh with session persistence
-- Retry with exponential backoff
-- Full Pydantic v2 validation
-- Multiple receipt items in single receipt
-- All client types (individual, legal entity, foreign)
-- Income list with pagination and filtering
-- Receipt cancellation with reason
-- HTTP/HTTPS and SOCKS proxy support
-- Typed public API for IDE support
-
-## Installation
+## Install
 
 ```bash
-pip install moy-nalog-api
+python -m pip install moy-nalog-api
 ```
 
-For SOCKS proxy support:
+Add the optional extra only when you need SOCKS4/5:
+
 ```bash
-pip install moy-nalog-api[socks]
+python -m pip install "moy-nalog-api[socks]"
 ```
 
-For development:
-```bash
-pip install moy-nalog-api[dev]
-```
+Requires Python 3.10+, `httpx` 0.25+, and Pydantic v2.
 
-## Quick Start
-
-### Async (Recommended)
+## Create your first receipt
 
 ```python
 import asyncio
 from decimal import Decimal
+
 from moy_nalog import MoyNalogClient
 
-async def main():
-    # Create client with session persistence
-    async with MoyNalogClient(session_file="session.json") as client:
 
-        # First run: authenticate
+async def main() -> None:
+    async with MoyNalogClient(
+        session_file=".moy-nalog-session.json",
+    ) as client:
         if not client.is_authenticated:
+            # Password login uses an INN, not a phone number.
             await client.auth_by_password("your_inn", "your_password")
 
-        # Create receipt
+        # This call registers a real receipt in the tax service.
         receipt = await client.create_receipt(
             name="Consulting services",
-            amount=Decimal("5000.00")
+            amount=Decimal("5000.00"),
         )
+        print(receipt.print_url)
 
-        print(f"Receipt created: {receipt.print_url}")
 
 asyncio.run(main())
 ```
 
-### Sync
+> **Real-account operation.** `create_receipt()` changes a real tax account. Keep the returned receipt ID,
+> verify the result in the personal cabinet, and cancel mistakes explicitly with
+> `cancel_receipt()`.
 
-```python
-from decimal import Decimal
-from moy_nalog import MoyNalogClientSync
+## What the client handles
 
-with MoyNalogClientSync(session_file="session.json") as client:
-    if not client.is_authenticated:
-        client.auth_by_password("your_inn", "your_password")
+| Boundary | Concrete behavior |
+| --- | --- |
+| Client shape | `MoyNalogClient` is async-first; `MoyNalogClientSync` delegates to the same implementation |
+| Authentication | Password login by INN, or a two-step phone + SMS challenge |
+| Session lifecycle | Optional JSON persistence, proactive refresh, and one refresh-and-replay after a server `401` |
+| Receipts | Single or multiple items, client type, payment type, creation, lookup, download, listing, and cancellation |
+| Transport | Native HTTP/HTTPS proxies, optional SOCKS, configurable timeouts, and bounded network backoff |
+| Failures | Public typed exceptions; validation and API failures are not flattened into transport errors |
 
-    receipt = client.create_receipt(
-        name="Consulting services",
-        amount=Decimal("5000.00")
-    )
-
-    print(f"Receipt created: {receipt.print_url}")
-```
+The public API returns Pydantic models such as `UserProfile`, `Receipt`, `IncomeList`, and
+`SMSChallenge`. Receipt amounts use `Decimal`.
 
 ## Authentication
 
-### Password Authentication
+### INN and password
 
-Use your INN (tax identification number) and password from nalog.ru. To sign in by phone, use SMS authentication instead:
+Password authentication calls the personal-cabinet login flow and requires a 10- or 12-digit INN:
 
 ```python
 profile = await client.auth_by_password(
-    username="123456789012",  # INN (10-12 digits)
-    password="your_password"
+    username="123456789012",
+    password="your_password",
 )
-print(f"Authenticated as: {profile.display_name}")
-print(f"INN: {profile.inn}")
-print(f"Status: {profile.status}")
+
+print(profile.display_name)
+print(profile.inn)
 ```
 
-### SMS Authentication
+Do not pass a phone number to `auth_by_password()`. Use the SMS flow for phone login.
 
-Two-step process for phone-based authentication:
+### Phone and SMS
 
 ```python
-# Step 1: Request SMS code
-phone = "79001234567"  # Format: 7XXXXXXXXXX (11 digits)
+phone = "79001234567"
+
 challenge = await client.request_sms_code(phone)
-print(f"SMS sent! Code expires in {challenge.expire_in} seconds")
+code = input("SMS code: ")
 
-# Step 2: Enter code and authenticate
-code = input("Enter 6-digit code from SMS: ")
-profile = await client.auth_by_sms(phone, challenge.challenge_token, code)
-print(f"Authenticated as: {profile.display_name}")
+profile = await client.auth_by_sms(
+    phone=phone,
+    challenge_token=challenge.challenge_token,
+    code=code,
+)
 ```
 
-### Session Persistence
+SMS start uses the service's v2 endpoint while verification uses v1; the client handles that API
+quirk internally.
 
-Save and restore authentication tokens automatically:
+### Session persistence
+
+Pass `session_file` to restore and save credentials automatically:
 
 ```python
-# Session file stores tokens between runs
-async with MoyNalogClient(session_file="session.json") as client:
-    # Check if already authenticated from a previous session
+async with MoyNalogClient(session_file=".moy-nalog-session.json") as client:
     if client.is_authenticated:
-        print("Session restored from file")
+        profile = await client.get_user_profile()
     else:
-        # Authenticate (tokens are saved automatically)
-        await client.auth_by_password(username, password)
-
-    # Tokens refresh automatically near expiration.
-    # The context manager closes the HTTP client and saves the session.
+        profile = await client.auth_by_password(username, password)
 ```
 
-Session file contains:
+The file contains access and refresh tokens, the authenticated INN, the device ID, and token
+timestamps. On POSIX systems it is written with owner-only permissions (`0o600`).
 
-- Access token (for API requests)
-- Refresh token (for token renewal)
-- Token expiration time
-- User INN and device ID
+> **Sensitive session data.** Never commit, share, or log a session file. Add its exact path to
+> `.gitignore`.
 
-Session files contain credentials and an INN. On POSIX systems they are written with owner-only
-permissions (`0o600`); do not commit, share, or log them.
-
-### Session and Token Management
-
-Both async and sync clients expose `is_authenticated`, `inn`, `access_token`, `refresh_token`,
-`token_expires_at`, `is_token_expired`, and `device_id`. Sessions can also be managed manually:
+Manual session controls are available when credentials come from another trusted store:
 
 ```python
-# Restore credentials obtained elsewhere
 client.set_tokens(
     access_token="access_token",
     refresh_token="refresh_token",
     inn="123456789012",
 )
 
-# Async client; omit await when using MoyNalogClientSync
 refreshed = await client.refresh_access_token()
-
-# Forget in-memory credentials and delete session_file, if configured
 client.clear_session()
 ```
 
-## Creating Receipts
+Both clients expose `is_authenticated`, `inn`, `access_token`, `refresh_token`,
+`token_expires_at`, `is_token_expired`, and `device_id`.
 
-### Simple Receipt
+Authentication validates the full response, including the profile, before replacing session data.
+A malformed response leaves the existing tokens and profile unchanged.
 
-```python
-from decimal import Decimal
+## Receipt operations
 
-receipt = await client.create_receipt(
-    name="Web development",
-    amount=Decimal("15000.00")
-)
-
-print(f"UUID: {receipt.uuid}")
-print(f"Amount: {receipt.total_amount} RUB")
-print(f"Print URL: {receipt.print_url}")
-print(f"JSON URL: {receipt.json_url}")
-```
-
-### Multiple Items
+### Multiple items
 
 ```python
 from decimal import Decimal
+
 from moy_nalog import ServiceItem
 
 items = [
     ServiceItem(name="Consulting", amount=Decimal("3000"), quantity=2),
-    ServiceItem(name="Development", amount=Decimal("10000"), quantity=1),
+    ServiceItem(name="Development", amount=Decimal("10000")),
     ServiceItem(name="Support", amount=Decimal("500"), quantity=4),
 ]
 
 receipt = await client.create_receipt_multi(items)
-# Total: 3000*2 + 10000*1 + 500*4 = 18000 RUB
-print(f"Total: {receipt.total_amount} RUB")
+print(receipt.total_amount)  # 18000
 ```
 
-### With Client Information
-
-#### Individual Client (default)
+### Client and payment type
 
 ```python
-from moy_nalog import Client, IncomeType
+from decimal import Decimal
 
-client_info = Client(
-    income_type=IncomeType.INDIVIDUAL,
-    display_name="Ivan Petrov",
-    contact_phone="+79001234567"
-)
+from moy_nalog import Client, IncomeType, PaymentType
 
-receipt = await client.create_receipt(
-    name="Service",
-    amount=Decimal("1000"),
-    client=client_info
-)
-```
-
-#### Legal Entity (Company)
-
-```python
 company = Client(
     income_type=IncomeType.LEGAL_ENTITY,
     display_name="OOO Romashka",
-    inn="7712345678"  # 10 digits for companies
+    inn="7712345678",
 )
 
 receipt = await client.create_receipt(
-    name="B2B Service",
+    name="B2B service",
     amount=Decimal("50000"),
-    client=company
+    client=company,
+    payment_type=PaymentType.WIRE,
 )
 ```
 
-#### Foreign Organization
+Available income sources are `INDIVIDUAL`, `LEGAL_ENTITY`, and `FOREIGN_AGENCY`. A wire transfer
+requires legal-entity client data with an INN.
 
-```python
-foreign = Client(
-    income_type=IncomeType.FOREIGN_AGENCY,
-    display_name="Acme Corporation",
-    inn="9909123456"
-)
-
-receipt = await client.create_receipt(
-    name="International consulting",
-    amount=Decimal("100000"),
-    client=foreign
-)
-```
-
-### Payment Types
-
-```python
-from moy_nalog import PaymentType
-
-# Cash or card payment (default)
-receipt = await client.create_receipt(
-    name="Service",
-    amount=Decimal("1000"),
-    payment_type=PaymentType.CASH
-)
-
-# Bank transfer (requires legal entity client with INN)
-receipt = await client.create_receipt(
-    name="Service",
-    amount=Decimal("50000"),
-    client=company,  # Must have INN
-    payment_type=PaymentType.WIRE
-)
-```
-
-## Canceling Receipts
-
-Cancel a receipt within the same tax period:
-Receipt IDs are validated before any request is sent.
-The client accepts FNS receipt IDs with 10 ASCII letters/digits and retains support for standard UUIDs.
-The public names `Receipt.uuid` and `receipt_uuid` are unchanged and accept either format.
-
-```python
-from moy_nalog import CancelReason
-
-# Cancel the receipt returned by create_receipt() or create_receipt_multi()
-await client.cancel_receipt(
-    receipt_uuid=receipt.uuid,
-    reason=CancelReason.REFUND
-)
-
-# Use CancelReason.MISTAKE instead when the receipt was created by mistake.
-```
-
-## Viewing Receipts
-
-### Get Income List
+### List, inspect, and download
 
 ```python
 from datetime import datetime
 
-# Get recent receipts (default: last 50)
-incomes = await client.get_incomes()
-
-for receipt in incomes.items:
-    status = "CANCELLED" if receipt.is_cancelled else "ACTIVE"
-    print(f"{receipt.uuid}: {receipt.total_amount} RUB [{status}]")
-
-print(f"Total count: {incomes.total}")
-print(f"Has more: {incomes.has_more}")
-```
-
-### With Filters and Pagination
-
-```python
 incomes = await client.get_incomes(
-    from_date=datetime(2024, 1, 1),
-    to_date=datetime(2024, 12, 31),
+    from_date=datetime(2026, 1, 1),
+    to_date=datetime(2026, 12, 31),
     offset=0,
-    limit=50
+    limit=50,
 )
 
-# Load more if needed
-if incomes.has_more:
-    more = await client.get_incomes(offset=50, limit=50)
+for item in incomes.items:
+    print(item.uuid, item.total_amount, item.is_cancelled)
+
+data = await client.get_receipt(incomes.items[0].uuid)
+json_bytes = await client.download_receipt_raw(incomes.items[0].uuid, format="json")
+print_bytes = await client.download_receipt_raw(incomes.items[0].uuid, format="print")
 ```
 
-### Get Receipt Details
+`get_receipt()` returns `None` only when the API reports `404`. By default, `download_receipt_raw()` returns
+`None` for `404`, permanent client errors such as `403`, or exhausted network/server retries.
+Permanent client errors stop after one attempt. On `401`, the client may refresh the
+token and replay once; failed authorization raises `TokenExpiredError`. Other `4xx` responses,
+except `404`, raise `MoyNalogError` or its subclasses when `strict_api_errors=True`.
+Rate-limit responses raise `RateLimitError` in both modes. Maintenance responses raise
+`ServiceUnavailableError` without retries. The `print` download is returned as raw bytes, normally
+containing HTML; the API does not expose a response content type through this client.
+
+With `strict_api_errors=True`, `get_incomes()` requires an explicit list of receipts and raises
+`MoyNalogError` on malformed responses. `find_receipt_candidates()` always performs this check,
+regardless of the setting; a malformed response cannot become an empty candidate list.
+An explicit empty list remains valid in both modes.
+
+### Cancel a receipt
 
 ```python
-# Get full receipt data as dict
-data = await client.get_receipt(receipt.uuid)
-if data:
-    print(f"Services: {data['services']}")
-    print(f"Payment type: {data['paymentType']}")
+from moy_nalog import CancelReason
 
-# Get printable URL
-url = client.get_receipt_print_url(receipt.uuid)
+await client.cancel_receipt(
+    receipt_uuid=receipt.uuid,
+    reason=CancelReason.MISTAKE,
+)
 ```
 
-`get_receipt()` returns `None` only when the API responds with HTTP 404. Authentication,
-rate-limit, maintenance, and other API failures raise their corresponding exception.
+Use `CancelReason.REFUND` for a refund. Receipt IDs are validated before any request is sent.
+The client accepts FNS receipt IDs with 10 ASCII letters/digits and retains support for standard UUIDs.
+The public names `Receipt.uuid` and `receipt_uuid` are unchanged and accept either format.
 
-### Download Receipt
+The returned `Receipt` has `is_cancelled=True` and retains receipt fields supplied by the server.
+If the response omits cancellation details, `cancellation_info` records the submitted reason and
+operation time; it does not invent a server registration time. If the amount is absent, the return
+value retains the existing `total_amount=0` fallback.
 
-Download receipt as raw bytes for saving or processing:
+## Reliability and errors
 
-```python
-# Download as JSON
-json_bytes = await client.download_receipt_raw(receipt.uuid, format="json")
-if json_bytes is not None:
-    with open("receipt.json", "wb") as f:
-        f.write(json_bytes)
+Version 1.1.0 keeps the download/income fallbacks and creation-error wrappers from 1.0.6 by default.
+Both clients accept
+`strict_api_errors=True` to enable stricter handling after updating application error handlers:
 
-# Download the printable representation (normally HTML)
-print_bytes = await client.download_receipt_raw(receipt.uuid, format="print")
-if print_bytes is not None:
-    with open("receipt.html", "wb") as f:
-        f.write(print_bytes)
-```
+| Operation | Default (`False`) | Strict mode (`True`) |
+| --- | --- | --- |
+| Permanent download errors such as `403` | Return `None` without retries | Raise `MoyNalogError` without retries |
+| Income response missing its list | Preserve the empty `IncomeList` fallback | Raise `MoyNalogError` |
+| Invalid income model fields | Preserve Pydantic validation errors | Raise `MoyNalogError` |
+| Unrecovered `401` or `429` during creation, with no earlier lost response | Preserve the `ReceiptError` wrapper | Raise `TokenExpiredError`/`RateLimitError` |
 
-The API returns raw bytes for `format="print"`; the client does not expose a response Content-Type.
+Missing credentials still raise `AuthenticationError` before creation in both modes.
+The new duplicate and unknown-outcome exceptions inherit from `ReceiptError`, so existing
+`except ReceiptError` handlers still catch them. A failed candidate lookup always raises an error;
+the default income-list fallback must not be used as proof that a receipt was never created.
 
-## Error Handling
+Near-expiry tokens refresh proactively. If an authenticated request still receives `401`, the
+client can refresh and replay that request once, even with `max_retries=1`. This replay does not
+consume a network retry attempt. Concurrent operations on the same client share an in-flight token
+refresh; cancelling one caller does not cancel the shared refresh. Network and timeout failures
+use the configured bounded backoff. Authentication, rate-limit, maintenance, validation, and other
+API failures keep their public exception types, with the creation wrappers described above.
+Receipt creation has additional uncertainty
+handling described below.
 
 ```python
 from moy_nalog import (
-    MoyNalogError,
     AuthenticationError,
-    InvalidCredentialsError,
-    TokenExpiredError,
-    SMSError,
-    SMSRateLimitError,
-    InvalidSMSCodeError,
-    ReceiptError,
-    ReceiptCreationUnknownError,
-    ValidationError,
     NetworkError,
     RateLimitError,
+    ReceiptError,
+    ReceiptCreationUnknownError,
     ServiceUnavailableError,
+    ValidationError,
 )
 
 try:
-    await client.auth_by_password(username, password)
-except InvalidCredentialsError:
-    print("Wrong username or password")
-except TokenExpiredError:
-    print("Session expired, re-authenticate")
-except AuthenticationError as e:
-    print(f"Auth failed: {e.message}")
-
-try:
-    await client.request_sms_code(phone)
-except SMSRateLimitError:
-    print("Too many SMS requests, wait a minute")
-except SMSError as e:
-    print(f"SMS error: {e.message}")
-
-try:
-    await client.create_receipt("Service", Decimal("1000"))
+    receipt = await client.create_receipt("Service", 1000)
 except ReceiptCreationUnknownError as exc:
     candidates = await client.find_receipt_candidates(exc.payload)
     for candidate in candidates:
         print("Candidate for review:", candidate.uuid)
     raise  # Keep the operation unresolved until its receipt is verified.
-except ReceiptError as e:
-    print(f"Receipt error: {e.message}")
-    print(f"Error code: {e.code}")
-    print(f"API response: {e.response}")
-
-try:
-    # Network issues are retried automatically
-    await client.get_incomes()
-except ServiceUnavailableError as e:
-    print(f"FNS is temporarily unavailable: {e.message}")
-except NetworkError:
-    print("Network unavailable after retries")
+except ServiceUnavailableError:
+    print("The tax service is temporarily unavailable")
 except RateLimitError:
     print("API rate limit exceeded")
+except (AuthenticationError, ValidationError, ReceiptError, NetworkError) as exc:
+    print(exc)
 ```
 
-`ServiceUnavailableError` is raised for HTTP 503 and known temporary-maintenance responses.
-These API responses are not retried with the short network backoff. If maintenance is reported
-during token refresh, the client keeps the current tokens and `refresh_access_token()` returns
-`False` as before.
+Authentication methods use typed failures such as `InvalidCredentialsError`,
+`InvalidSMSCodeError`, and `SMSRateLimitError`.
+
+All public exceptions derive from `MoyNalogError`. See
+[`moy_nalog/exceptions.py`](https://github.com/inache-su/moy-nalog-api/blob/main/moy_nalog/exceptions.py) for the complete hierarchy.
 
 ### Lost creation responses and duplicates
 
@@ -479,177 +352,122 @@ timestamps or automatically create a replacement receipt.
 
 ```python
 client = MoyNalogClient(
-    # Timezone for receipt timestamps (default: Europe/Moscow)
     timezone="Europe/Moscow",
-
-    # Request timeout in seconds (default: 30)
     timeout=30.0,
-
-    # Retry attempts for failed requests (default: 3)
     max_retries=3,
-
-    # Path to session file for persistence (optional)
-    session_file="session.json",
-
-    # Auto-refresh tokens before expiration (default: True)
+    session_file=".moy-nalog-session.json",
     auto_refresh_token=True,
-
-    # Proxy server URL (optional)
+    strict_api_errors=False,
     proxy="http://proxy.example.com:8080",
-
-    # Verify TLS certificates (default: True)
     verify_ssl=True,
-
-    # Custom User-Agent header (optional)
     user_agent="MyApp/1.0",
 )
 ```
 
-## Proxy Support
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `timezone` | `"Europe/Moscow"` | Receipt operation timestamps |
+| `timeout` | `30.0` | HTTP request timeout in seconds |
+| `max_retries` | `3` | Bounded attempts for network and timeout failures |
+| `session_file` | `None` | Optional persisted session path |
+| `auto_refresh_token` | `True` | Refresh tokens near expiration |
+| `strict_api_errors` | `False` | Opt into strict validation and specific creation/download errors |
+| `proxy` | `None` | HTTP, HTTPS, SOCKS4, or SOCKS5 proxy URL |
+| `verify_ssl` | `True` | TLS certificate verification |
+| `user_agent` | browser-compatible default | Custom request `User-Agent` |
 
-The client supports HTTP, HTTPS, and SOCKS proxies for all API requests.
-
-### HTTP/HTTPS Proxy
-
-```python
-# HTTP proxy (works out of the box)
-client = MoyNalogClient(proxy="http://proxy.example.com:8080")
-
-# With authentication
-client = MoyNalogClient(proxy="http://user:password@proxy.example.com:8080")
-
-# HTTPS proxy
-client = MoyNalogClient(proxy="https://proxy.example.com:8080")
-```
-
-### SOCKS Proxy
-
-SOCKS proxy support requires an additional dependency:
-
-```bash
-pip install moy-nalog-api[socks]
-```
+HTTP and HTTPS proxies use native `httpx`. SOCKS requires the `socks` extra:
 
 ```python
-# SOCKS5 proxy
-client = MoyNalogClient(proxy="socks5://proxy.example.com:1080")
-
-# SOCKS5 with authentication
 client = MoyNalogClient(proxy="socks5://user:password@proxy.example.com:1080")
-
-# SOCKS4 proxy
-client = MoyNalogClient(proxy="socks4://proxy.example.com:1080")
 ```
 
-### Sync Client
+Proxy credentials may be percent-encoded; existing escapes are preserved without double encoding.
+IPv6 proxy addresses retain their brackets, for example `http://user:password@[::1]:8080`.
 
-The synchronous wrapper also supports proxies:
+Keep `verify_ssl=True` unless a controlled intercepting proxy makes a different choice necessary.
+
+## Synchronous client
+
+The sync adapter mirrors the receipt, authentication, session, and profile methods:
 
 ```python
-client = MoyNalogClientSync(proxy="http://proxy.example.com:8080")
+from decimal import Decimal
+
+from moy_nalog import MoyNalogClientSync
+
+with MoyNalogClientSync(session_file=".moy-nalog-session.json") as client:
+    if not client.is_authenticated:
+        client.auth_by_password("your_inn", "your_password")
+
+    receipt = client.create_receipt(
+        name="Consulting services",
+        amount=Decimal("5000.00"),
+    )
+    print(receipt.print_url)
 ```
 
-## User Profile
+`MoyNalogClientSync` is not thread-safe and must not be called from an already-running async event
+loop. Create one instance per thread, or use `MoyNalogClient` directly in async code.
 
-```python
-profile = await client.get_user_profile()
+## Public API at a glance
 
-print(f"ID: {profile.id}")
-print(f"INN: {profile.inn}")
-print(f"Phone: {profile.phone}")
-print(f"Email: {profile.email}")
-print(f"Name: {profile.display_name}")
-print(f"Full name: {profile.full_name}")
-print(f"Status: {profile.status}")
-print(f"Registration date: {profile.registration_date}")
-```
+| Area | Methods |
+| --- | --- |
+| Authentication | `auth_by_password`, `request_sms_code`, `auth_by_sms`, `refresh_access_token` |
+| Session | `set_tokens`, `clear_session` |
+| Receipts | `create_receipt`, `create_receipt_multi`, `find_receipt_candidates`, `cancel_receipt`, `get_receipt` |
+| Receipt output | `get_receipt_print_url`, `download_receipt_raw` |
+| Account | `get_incomes`, `get_user_profile` |
 
-## Testing
+Async methods are awaited on `MoyNalogClient`; the sync adapter exposes the same operations without
+`await`.
 
-### Unit Tests
+## Development
 
 ```bash
-# Install dev dependencies
-pip install -e ".[dev]"
-
-# Run unit tests
+python -m pip install -e ".[dev]"
 pytest
-
-# Run with coverage
 pytest --cov=moy_nalog
+ruff check .
+mypy moy_nalog
 ```
 
-### Integration Test
-
-Interactive live-account test. Its default `auth_only` mode checks authentication and the user
-profile without creating receipts. The optional `full` mode exercises receipt operations.
-
-**Warning:** Full mode creates real receipts in the tax account. Cleanup is always attempted, but
-network failures, FNS maintenance, or process termination can leave receipts active. Verify the
-result in the personal cabinet after every full run.
+The unit suite is offline. The interactive integration script is separate because it can touch a
+real tax account:
 
 ```bash
 python scripts/integration_test.py
 ```
 
-**Default `auth_only` mode:**
+Its default `auth_only` mode authenticates and fetches the profile. The optional `full` mode creates,
+downloads, lists, and cancels real receipts. Cleanup is best-effort: inspect the personal cabinet
+after every full run. Logs and artifacts are written under `test_output/` and can contain sensitive
+account data.
 
-- One selected authentication flow: password with INN, or phone with SMS
-- User profile retrieval
-- Session persistence for password authentication
-
-**Additional checks in `full` mode:**
-
-- Simple receipt creation (1 item, cash payment)
-- Multi-item receipt (3 items with quantities)
-- Receipt with individual client info
-- Receipt with legal entity client (INN required)
-- Receipt with bank transfer payment (WIRE)
-- Income list retrieval with pagination
-- Receipt data retrieval by UUID
-- Receipt downloads in JSON and printable HTML form
-- Best-effort cancellation of every created receipt
-
-**How it works:**
-
-1. Choose authentication method (password or SMS)
-2. Choose test mode (`auth_only` is the default)
-3. Enter the INN and password, or the phone number and SMS code
-4. In full mode, the script runs receipt tests and attempts cleanup in a `finally` block
-5. Detailed log and JSON report are saved to the `test_output/` directory
-
-**Output:**
-
-- `test_output/<timestamp>/test_log_*.log` - detailed execution log
-- `test_output/<timestamp>/test_report_*.json` - JSON report with results
-- `test_output/<timestamp>/receipts/` - downloaded receipt files in full mode (JSON/HTML)
-
-## Requirements
+## Compatibility and status
 
 - Python 3.10+
-- httpx >= 0.25.0
-- pydantic >= 2.0.0
+- `httpx>=0.25.0`
+- `pydantic>=2.0.0`
+- HTTP/HTTPS proxies through `httpx`
+- Optional SOCKS4/5 through `httpx-socks`
 
-## Disclaimer
-
-This is an **unofficial** client. The API may change without notice. Use at your own risk. The author is not responsible for any issues with tax authorities.
-
-Always verify receipts in your personal cabinet at [lknpd.nalog.ru](https://lknpd.nalog.ru).
-
-## Author
-
-Kirill Nikulin (c) 2025-2026 [kirodev.eu](https://kirodev.eu)
-
-## License
-
-MIT License - see [LICENSE](LICENSE) file.
+The package is a stable public library, but its upstream API is private and undocumented. Review
+the [changelog](https://github.com/inache-su/moy-nalog-api/blob/main/CHANGELOG.md) before upgrading when your application depends on precise error or
+retry behavior.
 
 ## Contributing
 
-Contributions are welcome! Please:
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Run tests: `pytest`
-5. Run linting: `ruff check .`
-6. Submit a pull request
+Focused issues and pull requests are welcome. Please keep async behavior authoritative, preserve
+sync parity, avoid live API calls in unit tests, and run:
+
+```bash
+pytest
+ruff check .
+mypy moy_nalog
+```
+
+## License
+
+[MIT](https://github.com/inache-su/moy-nalog-api/blob/main/LICENSE) © 2025–2026 [Kirill Nikulin](https://kirodev.eu)

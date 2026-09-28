@@ -7,18 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-09-28
+
 ### Added
+- Optional `strict_api_errors=True` on both clients for strict income validation, explicit download failures, and specific authentication/rate-limit errors during creation
 - `DuplicateReceiptError` for `receipt.duplication` and its parent `ReceiptCreationUnknownError` for uncertain receipt creation; both retain a copy of the original payload and remain catchable as `ReceiptError`
 - Async and sync `find_receipt_candidates()` methods to compare the saved payload with paginated `get_incomes()` results without confirming or resubmitting a receipt
 
 ### Fixed
+- A `401` refresh-and-replay no longer consumes a network attempt, including with `max_retries=1` and after a prior timeout
+- Concurrent operations share one in-flight token refresh, and a late `401` reuses an already refreshed token; cancelling one caller does not cancel the shared refresh
+- Authentication validates the profile before changing session tokens or the stored INN
+- Cancelled receipts now report `is_cancelled=True`, retain server fields, and use the submitted cancellation reason/time when details are absent
+- Receipt candidate lookup rejects malformed income-list responses in both modes; direct `get_incomes()` enables this check with `strict_api_errors=True`
+- Raw downloads stop retrying permanent `4xx` failures; the default still returns `None`, while strict mode raises the API error. Authentication, rate-limit, and maintenance errors keep their existing behavior
+- Proxy credentials avoid double encoding, IPv6 proxy hosts retain their brackets, and native proxies work with the declared minimum HTTPX 0.25.0
 - Lost creation responses, unusable success responses, and unclassified server failures now report an unknown outcome; a later API rejection cannot erase uncertainty from an earlier lost response
 - Creation retries retain the original timestamps and line items; returned receipt items also use the submitted payload if the caller changes input objects while awaiting a response
 - Receipt reads, downloads, print URLs, and cancellation accept 10-character FNS IDs containing ASCII letters/digits as well as legacy UUIDs
-- Authentication and rate-limit errors during creation retain their public types when no earlier response was lost
+- Creation retains the 1.0.6 `ReceiptError` wrapper for server authentication/rate-limit failures by default; strict mode exposes the specific error when no earlier response was lost
+- An in-flight refresh cannot overwrite a cleared or replaced session
+- JSON requests and raw downloads share HTTP error classification for malformed error bodies
+
+### Compatibility
+- Existing constructor arguments, methods, exports, model fields, and session-file format remain available; the new strict error policy is disabled by default
+- Runtime requirements remain Python 3.10+, `httpx>=0.25.0`, and `pydantic>=2.0.0`; SOCKS remains optional
 
 ### Documentation
-- Documented duplicate handling, payload retention, and candidate review in both READMEs
+- Documented strict-mode migration, duplicate handling, payload retention, and candidate review in both READMEs
 
 ## [1.0.6] - 2026-07-20
 
