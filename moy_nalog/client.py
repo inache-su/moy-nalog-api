@@ -13,7 +13,7 @@ import secrets
 import string
 from collections.abc import Coroutine
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from types import TracebackType
 from typing import Any, TypeVar
@@ -25,11 +25,13 @@ import httpx
 from .enums import CancelReason, PaymentType
 from .exceptions import (
     AuthenticationError,
+    DuplicateReceiptError,
     InvalidCredentialsError,
     InvalidSMSCodeError,
     MoyNalogError,
     NetworkError,
     RateLimitError,
+    ReceiptCreationUnknownError,
     ReceiptError,
     ServiceUnavailableError,
     SMSError,
@@ -280,22 +282,28 @@ class MoyNalogClient:
 
     @staticmethod
     def _validate_receipt_uuid(value: str) -> str:
-        """Validate receipt UUID format.
+        """Validate a 10-character FNS receipt ID or a legacy UUID.
 
         Args:
-            value: Receipt UUID
+            value: FNS receipt ID or legacy UUID
 
         Returns:
-            Cleaned UUID string
+            Cleaned identifier string
 
         Raises:
-            ValidationError: If UUID format is invalid
+            ValidationError: If the identifier format is invalid
         """
+        if not isinstance(value, str):
+            raise ValidationError("Receipt ID must be a string")
         value = value.strip()
+        if len(value) == 10 and value.isascii() and value.isalnum():
+            return value
         try:
             UUID(value)
         except (AttributeError, ValueError) as e:
-            raise ValidationError("Receipt UUID must be a valid UUID") from e
+            raise ValidationError(
+                "Receipt ID must be 10 ASCII letters/digits or a valid UUID"
+            ) from e
         return value
 
     async def _retry_delay(self, attempt: int, context: str, error: Exception | None) -> None:
@@ -465,6 +473,7 @@ class MoyNalogClient:
 
         last_error: Exception | None = None
         refreshed_on_401 = False
+        creating_receipt = method == "POST" and endpoint == "/income"
 
         for attempt in range(self.max_retries):
             try:
@@ -499,6 +508,10 @@ class MoyNalogClient:
                 if response.status_code >= 400:
                     error_msg = data.get("message") or data.get("exceptionMessage") or f"HTTP {response.status_code}"
                     error_code = data.get("code")
+                    if creating_receipt and error_code == "receipt.duplication":
+                        raise DuplicateReceiptError(
+                            error_msg, code=error_code, response=data, payload=payload or {},
+                        )
                     if self._is_service_unavailable_response(
                         response.status_code,
                         error_msg,
@@ -515,6 +528,10 @@ class MoyNalogClient:
                             code=error_code,
                             response=data,
                         )
+                    if creating_receipt and response.status_code >= 500:
+                        raise ReceiptCreationUnknownError(
+                            error_msg, code=error_code, response=data, payload=payload or {},
+                        )
                     raise MoyNalogError(error_msg, code=error_code, response=data)
 
                 return data
@@ -523,10 +540,25 @@ class MoyNalogClient:
                 last_error = NetworkError(f"Request timeout: {e}")
             except httpx.RequestError as e:
                 last_error = NetworkError(f"Network error: {e}")
-            except (TokenExpiredError, RateLimitError, MoyNalogError):
+            except MoyNalogError as e:
+                if (
+                    creating_receipt
+                    and last_error is not None
+                    and e.code != "receipt.duplication"
+                    and not isinstance(e, ReceiptCreationUnknownError)
+                ):
+                    raise ReceiptCreationUnknownError(
+                        "A previous receipt submission lost its response; reconcile the outcome",
+                        code=e.code, response=e.response, payload=payload or {},
+                    ) from e
                 raise
             except Exception as e:
                 logger.error("Unexpected error in _request", exc_info=True)
+                if creating_receipt:
+                    raise ReceiptCreationUnknownError(
+                        "Unexpected receipt creation response; reconcile the outcome",
+                        payload=payload or {},
+                    ) from e
                 raise MoyNalogError(f"Unexpected error: {e}") from e
 
             if attempt < self.max_retries - 1:
@@ -814,6 +846,8 @@ class MoyNalogClient:
             Receipt with print_url and json_url
 
         Raises:
+            DuplicateReceiptError: FNS reported a duplicate; outcome is unconfirmed
+            ReceiptCreationUnknownError: Creation may have succeeded
             ReceiptError: Receipt creation failed
             AuthenticationError: Not authenticated
         """
@@ -840,6 +874,8 @@ class MoyNalogClient:
             Receipt with print_url and json_url
 
         Raises:
+            DuplicateReceiptError: FNS reported a duplicate; outcome is unconfirmed
+            ReceiptCreationUnknownError: Creation may have succeeded
             ReceiptError: Receipt creation failed
         """
         if not self.is_authenticated or not self._inn:
@@ -857,6 +893,7 @@ class MoyNalogClient:
 
         client_data = (client or Client()).to_api_dict()
 
+        # Build once: retries must preserve operationTime, requestTime, and line items.
         payload = {
             "operationTime": op_time_dt.isoformat(),
             "requestTime": req_time_dt.isoformat(),
@@ -869,14 +906,26 @@ class MoyNalogClient:
 
         try:
             data = await self._request("POST", "/income", payload, with_auth=True)
-        except ServiceUnavailableError:
+        except (ReceiptCreationUnknownError, AuthenticationError, RateLimitError, ServiceUnavailableError):
             raise
+        except NetworkError as e:
+            raise ReceiptCreationUnknownError(
+                "Receipt creation response was not received; reconcile before submitting again",
+                code=e.code, response=e.response, payload=payload,
+            ) from e
         except MoyNalogError as e:
+            if e.code == "receipt.duplication":
+                raise DuplicateReceiptError(
+                    e.message, code=e.code, response=e.response, payload=payload,
+                ) from e
             raise ReceiptError(e.message, code=e.code, response=e.response) from e
 
-        receipt_uuid = data.get("approvedReceiptUuid")
-        if not receipt_uuid:
-            raise ReceiptError("No receipt UUID in response", response=data)
+        receipt_uuid = data.get("approvedReceiptUuid") if isinstance(data, dict) else None
+        if not isinstance(receipt_uuid, str) or not receipt_uuid.strip():
+            raise ReceiptCreationUnknownError(
+                "No receipt UUID in response; reconcile before submitting again",
+                response=data, payload=payload,
+            )
 
         receipt = Receipt(
             uuid=receipt_uuid,
@@ -884,13 +933,76 @@ class MoyNalogClient:
             operation_time=op_time_dt,
             request_time=req_time_dt,
             payment_type=payment_type.value,
-            services=[item.to_api_dict() for item in items],
+            services=payload["services"],
         )
         receipt.print_url = f"{self.API_URL_V1}/receipt/{self._inn}/{receipt_uuid}/print"
         receipt.json_url = f"{self.API_URL_V1}/receipt/{self._inn}/{receipt_uuid}/json"
 
         logger.info(f"Receipt created: {receipt_uuid}, amount: {total_amount}")
         return receipt
+
+    async def find_receipt_candidates(self, payload: dict[str, Any]) -> list[Receipt]:
+        """Find active candidates via get_incomes() for an uncertain creation payload.
+
+        Scan all pages for the operation's UTC date and compare operation time,
+        total, payment type, and line items. Reject a conflicting income type
+        when supplied by FNS. Candidates require buyer/business-record review;
+        even an empty result does not establish that creation failed.
+
+        Args:
+            payload: Original payload from ReceiptCreationUnknownError (or its
+                DuplicateReceiptError subclass), used with the same tax account
+
+        Raises:
+            ValidationError: Invalid creation payload
+            MoyNalogError: Lookup failed or pagination is incomplete
+        """
+        try:
+            time_value = payload["operationTime"]
+            if not isinstance(time_value, str):
+                raise ValueError("operationTime must be an ISO 8601 string")
+            operation_time = self._parse_datetime(time_value)
+            if operation_time.utcoffset() is None:
+                raise ValueError("operationTime must include a timezone")
+            total = Decimal(payload["totalAmount"])
+            services = [ServiceItem.model_validate(item) for item in payload["services"]]
+            if not services or total != sum(item.total for item in services):
+                raise ValueError("totalAmount must equal the line item total")
+            payment_type = PaymentType(payload["paymentType"]).value
+            buyer = Client.model_validate(payload["client"])
+        except (KeyError, TypeError, ValueError, InvalidOperation) as e:
+            raise ValidationError("Invalid receipt creation payload") from e
+
+        date = operation_time.astimezone(timezone.utc)
+        candidates: dict[str, Receipt] = {}
+        offset = 0
+        while True:
+            incomes = await self.get_incomes(from_date=date, to_date=date, offset=offset)
+            for receipt in incomes.items:
+                if (
+                    receipt.is_cancelled
+                    or receipt.operation_time != operation_time
+                    or receipt.total_amount != total
+                    or receipt.payment_type != payment_type
+                    or receipt.income_type not in (None, buyer.income_type.value)
+                ):
+                    continue
+                try:
+                    actual_services = [ServiceItem.model_validate(item) for item in receipt.services]
+                except (TypeError, ValueError, InvalidOperation):
+                    continue
+                if actual_services == services:
+                    candidates[receipt.uuid] = receipt
+
+            if not incomes.has_more:
+                return list(candidates.values())
+            next_offset = incomes.offset + len(incomes.items)
+            if next_offset <= offset:
+                raise ReceiptCreationUnknownError(
+                    "Income pagination did not advance; receipt creation remains unconfirmed",
+                    payload=payload,
+                )
+            offset = next_offset
 
     async def cancel_receipt(
         self,
@@ -902,7 +1014,7 @@ class MoyNalogClient:
         Cancel (void) a receipt.
 
         Args:
-            receipt_uuid: UUID of receipt to cancel
+            receipt_uuid: FNS receipt ID or legacy UUID to cancel
             reason: Cancellation reason (REFUND or MISTAKE)
             operation_time: Cancellation time
 
@@ -951,7 +1063,7 @@ class MoyNalogClient:
         Get receipt data as JSON.
 
         Args:
-            receipt_uuid: Receipt UUID
+            receipt_uuid: FNS receipt ID or legacy UUID
 
         Returns:
             Receipt data dict, or None when the receipt is not found
@@ -980,7 +1092,7 @@ class MoyNalogClient:
         """Get URL for printable receipt form.
 
         Args:
-            receipt_uuid: Receipt UUID
+            receipt_uuid: FNS receipt ID or legacy UUID
 
         Returns:
             URL string for printable receipt
@@ -1003,7 +1115,7 @@ class MoyNalogClient:
         Download receipt in specified format with retry logic.
 
         Args:
-            receipt_uuid: Receipt UUID
+            receipt_uuid: FNS receipt ID or legacy UUID
             format: Output format - "json" or "print" (default: "json")
 
         Returns:
@@ -1286,6 +1398,9 @@ class MoyNalogClientSync:
 
     def create_receipt_multi(self, items: list[ServiceItem], **kwargs: Any) -> Receipt:
         return self._run(self._client.create_receipt_multi(items, **kwargs))
+
+    def find_receipt_candidates(self, payload: dict[str, Any]) -> list[Receipt]:
+        return self._run(self._client.find_receipt_candidates(payload))
 
     def cancel_receipt(self, receipt_uuid: str, **kwargs: Any) -> Receipt:
         return self._run(self._client.cancel_receipt(receipt_uuid, **kwargs))

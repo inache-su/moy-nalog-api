@@ -28,11 +28,13 @@ from .client import MoyNalogClient, MoyNalogClientSync
 from .enums import CancelReason, IncomeType, PaymentType
 from .exceptions import (
     AuthenticationError,
+    DuplicateReceiptError,
     InvalidCredentialsError,
     InvalidSMSCodeError,
     MoyNalogError,
     NetworkError,
     RateLimitError,
+    ReceiptCreationUnknownError,
     ReceiptError,
     ServiceUnavailableError,
     SMSError,
@@ -83,6 +85,8 @@ __all__ = [
     "SMSRateLimitError",
     "InvalidSMSCodeError",
     "ReceiptError",
+    "ReceiptCreationUnknownError",
+    "DuplicateReceiptError",
     "ValidationError",
     "NetworkError",
     "RateLimitError",

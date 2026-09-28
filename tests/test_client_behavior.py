@@ -8,14 +8,20 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 from moy_nalog import (
     AuthenticationError,
+    DuplicateReceiptError,
     InvalidCredentialsError,
     MoyNalogClient,
     MoyNalogClientSync,
+    NetworkError,
     RateLimitError,
+    ReceiptCreationUnknownError,
+    ReceiptError,
+    ServiceItem,
     ServiceUnavailableError,
     TokenExpiredError,
     ValidationError,
@@ -411,3 +417,240 @@ class TestSyncLoopGuard:
         sync = MoyNalogClientSync()
         with pytest.raises(RuntimeError, match="async"):
             sync._get_loop()
+
+
+class TestReceiptCreationOutcome:
+    @pytest.mark.parametrize("multi", [False, True])
+    async def test_accepted_receipt_lost_response_then_duplicate(self, multi):
+        submissions = []
+        registered = []
+        item = ServiceItem(name="Service", amount=Decimal("100.00"))
+        duplicate = {"code": "receipt.duplication", "message": "Receipt already exists"}
+
+        def handle(request):
+            if request.method == "POST":
+                assert request.url.path == "/api/v1/income"
+                submissions.append(request.content)
+                if len(submissions) == 1:
+                    registered.append({
+                        **json.loads(request.content),
+                        "approvedReceiptUuid": "abcd123456",
+                    })
+                    raise httpx.ReadTimeout("Response lost after registration", request=request)
+                return httpx.Response(400, json=duplicate)
+            assert request.url.path == "/api/v1/incomes"
+            return httpx.Response(200, json={"content": registered})
+
+        async with MoyNalogClient(max_retries=3) as client:
+            client.set_tokens("test", inn="test-account")
+            client._client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+
+            async def retry_delay(*args):
+                item.name = "Changed while waiting"
+
+            client._retry_delay = AsyncMock(side_effect=retry_delay)
+            with pytest.raises(DuplicateReceiptError) as exc_info:
+                if multi:
+                    await client.create_receipt_multi([item])
+                else:
+                    await client.create_receipt(item.name, item.amount)
+
+            error = exc_info.value
+            assert isinstance(error, ReceiptError)
+            assert error.code == "receipt.duplication"
+            assert error.response == duplicate
+            assert len(submissions) == 2
+            assert submissions[0] == submissions[1]
+            assert error.payload == json.loads(submissions[0])
+            changed_copy = error.payload
+            changed_copy["services"][0]["name"] = "Changed by caller"
+            assert error.payload["services"][0]["name"] == "Service"
+            assert "operationTime" not in str(error)
+            client._retry_delay.assert_awaited_once()
+
+            candidates = await client.find_receipt_candidates(error.payload)
+            assert [r.uuid for r in candidates] == ["abcd123456"]
+            assert len(registered) == 1
+            assert len(submissions) == 2
+
+    @pytest.mark.parametrize("failure", [httpx.ReadTimeout, httpx.ReadError])
+    async def test_exhausted_network_attempts_have_unknown_outcome(self, failure):
+        async with MoyNalogClient(max_retries=2) as client:
+            client.set_tokens("test", inn="test-account")
+            client._retry_delay = AsyncMock()
+            http = _attach_http(client, post=AsyncMock(side_effect=failure("Response lost")))
+            with pytest.raises(ReceiptCreationUnknownError) as exc_info:
+                await client.create_receipt("Service", 100)
+            assert type(exc_info.value) is ReceiptCreationUnknownError
+            assert isinstance(exc_info.value.__cause__, NetworkError)
+            assert http.post.await_count == 2
+            assert exc_info.value.payload == http.post.call_args.kwargs["json"]
+
+    @pytest.mark.parametrize("body", ["", "not-json", "[]", "{}", '{"approvedReceiptUuid": 123}'])
+    @pytest.mark.parametrize("status", [200, 500])
+    async def test_unusable_response_is_unknown_and_not_retried(self, body, status):
+        async with MoyNalogClient() as client:
+            client.set_tokens("test", inn="test-account")
+            http = _attach_http(client, post=AsyncMock(return_value=httpx.Response(status, text=body)))
+            with pytest.raises(ReceiptCreationUnknownError):
+                await client.create_receipt("Service", 100)
+            assert http.post.await_count == 1
+
+    @pytest.mark.parametrize("lost_response", [False, True])
+    @pytest.mark.parametrize(
+        ("status", "code", "error_type"),
+        [
+            (400, "receipt.invalid", ReceiptError),
+            (401, "unauthorized", TokenExpiredError),
+            (429, "rate.limit", RateLimitError),
+            (503, "service_unavailable", ServiceUnavailableError),
+            (500, "internal.error", ReceiptCreationUnknownError),
+            (400, "receipt.duplication", DuplicateReceiptError),
+            (503, "receipt.duplication", DuplicateReceiptError),
+        ],
+    )
+    async def test_api_failure_does_not_erase_a_lost_response(
+        self, lost_response, status, code, error_type,
+    ):
+        responses = [FakeResponse(status, {"code": code, "message": "Rejected"})]
+        if lost_response:
+            responses.insert(0, httpx.ReadTimeout("Response lost"))
+        expected = (
+            ReceiptCreationUnknownError
+            if lost_response and error_type is not DuplicateReceiptError
+            else error_type
+        )
+        async with MoyNalogClient() as client:
+            client.set_tokens("test", inn="test-account")
+            client._retry_delay = AsyncMock()
+            http = _attach_http(client, post=AsyncMock(side_effect=responses))
+            with pytest.raises(expected) as exc_info:
+                await client.create_receipt("Service", 100)
+            assert type(exc_info.value) is expected
+            assert http.post.await_count == 1 + int(lost_response)
+
+    async def test_token_refresh_reuses_the_creation_payload(self):
+        item = ServiceItem(name="Service", amount=Decimal("100"))
+
+        async def refresh():
+            item.name = "Changed while refreshing"
+            return True
+
+        async with MoyNalogClient() as client:
+            client.set_tokens("test", "refresh", "test-account", expire_at=_future())
+            client._do_refresh_token = AsyncMock(side_effect=refresh)
+            http = _attach_http(client, post=AsyncMock(side_effect=[
+                FakeResponse(401), FakeResponse(200, {"approvedReceiptUuid": "abcd123456"}),
+            ]))
+            receipt = await client.create_receipt_multi([item])
+            assert receipt.uuid == "abcd123456"
+            assert receipt.services[0]["name"] == "Service"
+            assert http.post.call_args_list[0].kwargs["json"] == http.post.call_args_list[1].kwargs["json"]
+            client._do_refresh_token.assert_awaited_once()
+
+    def test_sync_preserves_duplicate_and_exposes_read_only_lookup(self):
+        with MoyNalogClientSync() as client:
+            client.set_tokens("test", inn="test-account")
+            http = _attach_http(
+                client._client,
+                post=AsyncMock(return_value=FakeResponse(400, {"code": "receipt.duplication"})),
+                get=AsyncMock(return_value=FakeResponse(200, {"content": []})),
+            )
+            with pytest.raises(DuplicateReceiptError) as exc_info:
+                client.create_receipt("Service", 100)
+            assert client.find_receipt_candidates(exc_info.value.payload) == []
+            assert http.post.await_count == 1
+            assert http.get.await_count == 1
+
+
+class TestReceiptCandidateLookup:
+    async def test_pagination_matching_and_utc_date(self):
+        payload = {
+            "operationTime": "2026-09-28T01:00:00+03:00",
+            "requestTime": "2026-09-28T01:00:00+03:00",
+            "services": [{"name": "Service", "amount": "100.00", "quantity": 1}],
+            "totalAmount": "100.00",
+            "paymentType": "CASH",
+            "client": {"incomeType": "FROM_INDIVIDUAL"},
+        }
+        match = {**payload, "approvedReceiptUuid": "abcd123456"}
+        others = [
+            {**match, "totalAmount": "200"},
+            {**match, "services": [{"name": "Other", "amount": "100", "quantity": 1}]},
+            {**match, "services": []},
+            {**match, "services": [{"name": "Service", "amount": "invalid"}]},
+            {**match, "paymentType": "WIRE"},
+            {**match, "incomeType": "FROM_LEGAL_ENTITY"},
+            {**match, "operationTime": "2026-09-28T01:00:01+03:00"},
+            {**match, "cancellationInfo": {"comment": "Mistake"}},
+        ]
+        async with MoyNalogClient() as client:
+            client.set_tokens("test", inn="test-account")
+            http = _attach_http(client, get=AsyncMock(side_effect=[
+                FakeResponse(200, {"content": others, "hasMore": True, "currentOffset": 0}),
+                FakeResponse(200, {"content": [
+                    {**match, "totalAmount": "100", "operationTime": "2026-09-27T22:00:00Z"},
+                    {**match, "approvedReceiptUuid": "efgh123456"},
+                ], "currentOffset": len(others)}),
+            ]))
+            candidates = await client.find_receipt_candidates(payload)
+            assert [r.uuid for r in candidates] == ["abcd123456", "efgh123456"]
+            params = [call.kwargs["params"] for call in http.get.call_args_list]
+            assert [p["offset"] for p in params] == [0, len(others)]
+            assert params[0]["from"] == "2026-09-27T00:00:00.000Z"
+            assert params[0]["to"] == "2026-09-27T23:59:59.999Z"
+            http.post.assert_not_called()
+
+    @pytest.mark.parametrize("payload", [{}, {"operationTime": None}, {"operationTime": "2026-09-28"}])
+    async def test_invalid_payload_rejected_without_request(self, payload):
+        async with MoyNalogClient() as client:
+            client.get_incomes = AsyncMock()
+            with pytest.raises(ValidationError):
+                await client.find_receipt_candidates(payload)
+            client.get_incomes.assert_not_awaited()
+
+    async def test_incomplete_lookup_does_not_report_no_match(self):
+        async with MoyNalogClient() as client:
+            client.set_tokens("test", inn="test-account")
+            http = _attach_http(client, post=AsyncMock(return_value=FakeResponse(400, {
+                "code": "receipt.duplication",
+            })), get=AsyncMock(return_value=FakeResponse(200, {"content": [], "hasMore": True})))
+            with pytest.raises(DuplicateReceiptError) as exc_info:
+                await client.create_receipt("Service", 100)
+            with pytest.raises(ReceiptCreationUnknownError, match="pagination"):
+                await client.find_receipt_candidates(exc_info.value.payload)
+            assert http.get.await_count == 1
+
+
+class TestFNSReceiptIdentifiers:
+    @pytest.mark.parametrize("identifier", ["abcd123456", "ABCD123456", VALID_RECEIPT_UUID])
+    async def test_identifier_works_for_all_receipt_operations(self, identifier):
+        async with MoyNalogClient() as client:
+            client.set_tokens("test", inn="test-account")
+            http = _attach_http(
+                client,
+                get=AsyncMock(return_value=FakeResponse(200, {"ok": True}, content=b"receipt")),
+                post=AsyncMock(return_value=FakeResponse(200, {})),
+            )
+            value = f"  {identifier}  "
+            assert await client.get_receipt(value) == {"ok": True}
+            assert http.get.call_args.args[0].endswith(f"/test-account/{identifier}/json")
+            assert await client.download_receipt_raw(value) == b"receipt"
+            assert http.get.call_args.args[0].endswith(f"/test-account/{identifier}/json")
+            assert client.get_receipt_print_url(value).endswith(f"/test-account/{identifier}/print")
+            assert (await client.cancel_receipt(value)).uuid == identifier
+            assert http.post.call_args.kwargs["json"]["receiptUuid"] == identifier
+
+    @pytest.mark.parametrize("value", [None, 123, "abc123", "abcdefghijk", "../abcdefg", "abcd?12345", "абвг123456"])
+    async def test_invalid_identifier_never_reaches_http(self, value):
+        async with MoyNalogClient() as client:
+            client.set_tokens("test", inn="test-account")
+            client._request = AsyncMock()
+            client._get_client = AsyncMock()
+            for method in (client.get_receipt, client.download_receipt_raw, client.cancel_receipt):
+                with pytest.raises(ValidationError):
+                    await method(value)
+            with pytest.raises(ValidationError):
+                client.get_receipt_print_url(value)
+            client._request.assert_not_awaited()
+            client._get_client.assert_not_awaited()

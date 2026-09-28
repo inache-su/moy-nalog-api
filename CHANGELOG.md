@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `DuplicateReceiptError` for `receipt.duplication` and its parent `ReceiptCreationUnknownError` for uncertain receipt creation; both retain a copy of the original payload and remain catchable as `ReceiptError`
+- Async and sync `find_receipt_candidates()` methods to compare the saved payload with paginated `get_incomes()` results without confirming or resubmitting a receipt
+
+### Fixed
+- Lost creation responses, unusable success responses, and unclassified server failures now report an unknown outcome; a later API rejection cannot erase uncertainty from an earlier lost response
+- Creation retries retain the original timestamps and line items; returned receipt items also use the submitted payload if the caller changes input objects while awaiting a response
+- Receipt reads, downloads, print URLs, and cancellation accept 10-character FNS IDs containing ASCII letters/digits as well as legacy UUIDs
+- Authentication and rate-limit errors during creation retain their public types when no earlier response was lost
+
+### Documentation
+- Documented duplicate handling, payload retention, and candidate review in both READMEs
+
 ## [1.0.6] - 2026-07-20
 
 ### Added

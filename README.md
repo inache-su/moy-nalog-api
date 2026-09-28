@@ -299,8 +299,9 @@ receipt = await client.create_receipt(
 ## Canceling Receipts
 
 Cancel a receipt within the same tax period:
-Pass the UUID returned by a receipt creation or income-list operation; malformed UUIDs raise
-`ValidationError` before a request is sent.
+Receipt IDs are validated before any request is sent.
+The client accepts FNS receipt IDs with 10 ASCII letters/digits and retains support for standard UUIDs.
+The public names `Receipt.uuid` and `receipt_uuid` are unchanged and accept either format.
 
 ```python
 from moy_nalog import CancelReason
@@ -395,6 +396,7 @@ from moy_nalog import (
     SMSRateLimitError,
     InvalidSMSCodeError,
     ReceiptError,
+    ReceiptCreationUnknownError,
     ValidationError,
     NetworkError,
     RateLimitError,
@@ -419,6 +421,11 @@ except SMSError as e:
 
 try:
     await client.create_receipt("Service", Decimal("1000"))
+except ReceiptCreationUnknownError as exc:
+    candidates = await client.find_receipt_candidates(exc.payload)
+    for candidate in candidates:
+        print("Candidate for review:", candidate.uuid)
+    raise  # Keep the operation unresolved until its receipt is verified.
 except ReceiptError as e:
     print(f"Receipt error: {e.message}")
     print(f"Error code: {e.code}")
@@ -439,6 +446,34 @@ except RateLimitError:
 These API responses are not retried with the short network backoff. If maintenance is reported
 during token refresh, the client keeps the current tokens and `refresh_access_token()` returns
 `False` as before.
+
+### Lost creation responses and duplicates
+
+`DuplicateReceiptError` identifies the exact FNS code `receipt.duplication`. It is a subclass of
+`ReceiptCreationUnknownError`, which derives from `ReceiptError`. A duplicate response confirms
+neither that this submission succeeded nor that another receipt should be created.
+
+`ReceiptCreationUnknownError` also covers exhausted network attempts, an unusable success response,
+and server errors other than separately classified maintenance responses. If an earlier attempt
+lost its response, a later API rejection leaves creation uncertain; that response is retained in
+`exc.response`. Neither exception triggers another creation request.
+
+Within a creation call, retries reuse the original payload, including `operationTime`,
+`requestTime`, and all line items. Both exceptions expose a copy through `exc.payload`; changing
+that copy does not alter the saved payload. The SDK retains it in memory only. Store it with the
+pending operation in private application storage if reconciliation must survive a restart.
+A new `create_receipt()` call builds a new payload and is not an idempotent retry.
+
+`find_receipt_candidates(exc.payload)` uses `get_incomes()` to scan every page for the operation's
+UTC date on the same tax account. It compares the exact operation time, total, payment type, and
+line items in order, including quantities. A conflicting income type, when returned, excludes the
+receipt, as does cancellation. Both async and sync clients provide this read-only lookup.
+
+Every result is a candidate requiring review, even when only one is found. Compare buyer details
+from `get_receipt(candidate.uuid)` with the original payload and your payment records before
+confirming the operation. An empty list, missing receipt fields, multiple candidates, or a lookup
+failure does not prove that creation failed. Keep the operation unresolved; do not change its
+timestamps or automatically create a replacement receipt.
 
 ## Configuration
 
