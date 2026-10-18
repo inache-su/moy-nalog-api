@@ -1,19 +1,12 @@
-<p align="center">
+<p>
   <img
     src="https://raw.githubusercontent.com/inache-su/moy-nalog-api/main/assets/readme/hero-ru.svg"
     width="100%"
-    alt="moy-nalog-api — типизированный async- и sync-доступ из Python к аутентификации, сессиям и операциям с чеками lknpd.nalog.ru"
+    alt="moy-nalog-api от kirodev.eu. Типизированный Python-клиент для «Моего налога». Python 3.10+, async и sync, Pydantic v2."
   >
 </p>
 
-<p align="center">
-  <a href="https://pypi.org/project/moy-nalog-api/"><img src="https://img.shields.io/pypi/v/moy-nalog-api?label=PyPI&color=EF5A5A" alt="Версия на PyPI"></a>
-  <a href="https://pypi.org/project/moy-nalog-api/"><img src="https://img.shields.io/pypi/pyversions/moy-nalog-api?color=3776AB" alt="Поддерживаемые версии Python"></a>
-  <a href="https://github.com/inache-su/moy-nalog-api/blob/main/LICENSE"><img src="https://img.shields.io/github/license/inache-su/moy-nalog-api?color=0D1117" alt="Лицензия MIT"></a>
-  <img src="https://img.shields.io/badge/typed-Pydantic%20v2-EF5A5A" alt="Типизация на Pydantic v2">
-</p>
-
-<p align="center">
+<p>
   <a href="https://github.com/inache-su/moy-nalog-api/blob/main/README.md">English version</a>
   ·
   <a href="https://pypi.org/project/moy-nalog-api/">PyPI</a>
@@ -21,12 +14,19 @@
   <a href="https://github.com/inache-su/moy-nalog-api/blob/main/CHANGELOG.md">История изменений</a>
   ·
   <a href="https://github.com/inache-su/moy-nalog-api/tree/main/examples">Примеры</a>
+  ·
+  <a href="https://github.com/inache-su/moy-nalog-api/blob/main/LICENSE">Лицензия MIT</a>
 </p>
 
 `moy-nalog-api` — неофициальный Python-клиент для сервиса самозанятых
 `lknpd.nalog.ru`. Он объединяет аутентификацию, обновление токенов, сохранение сессии,
 повторные сетевые запросы и модели чеков в одном типизированном async API с аналогичной
 синхронной обёрткой.
+
+[Установка](#установка) · [Первый чек](#первый-чек) ·
+[Аутентификация](#аутентификация) · [Чеки](#операции-с-чеками) ·
+[Ошибки](#надёжность-и-ошибки) · [Конфигурация](#конфигурация) ·
+[Sync-клиент](#синхронный-клиент) · [Справочник API](#краткая-карта-публичного-api)
 
 > **Неофициальный клиент.** Проект не связан с Федеральной налоговой службой России. Закрытый API
 > может измениться без предупреждения. Всегда проверяйте зарегистрированные и аннулированные чеки в
@@ -78,13 +78,13 @@ asyncio.run(main())
 > Сохраните идентификатор чека, проверьте результат в личном кабинете и явно аннулируйте ошибочный чек через
 > `cancel_receipt()`.
 
-## Что берёт на себя клиент
+## Возможности
 
-| Граница | Конкретное поведение |
+| Область | Поддержка |
 | --- | --- |
-| Устройство клиента | `MoyNalogClient` — основная async-реализация; `MoyNalogClientSync` делегирует ей операции |
+| Клиенты | `MoyNalogClient` — основная async-реализация; `MoyNalogClientSync` делегирует ей операции |
 | Аутентификация | Вход по ИНН и паролю или двухэтапная проверка по телефону и СМС |
-| Жизненный цикл сессии | Опциональное хранение в JSON, проактивное обновление и одно обновление с повтором после ответа `401` |
+| Сессии | Опциональное хранение в JSON, проактивное обновление и одно обновление с повтором после ответа `401` |
 | Чеки | Одна или несколько позиций, тип клиента, вид оплаты, создание, просмотр, скачивание, список и аннулирование |
 | Транспорт | Нативные HTTP/HTTPS-прокси, опциональный SOCKS, настраиваемые таймауты и ограниченный backoff |
 | Ошибки | Публичная типизированная иерархия; ошибки валидации и API не маскируются под сетевые |

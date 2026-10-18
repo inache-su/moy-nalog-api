@@ -1,19 +1,12 @@
-<p align="center">
+<p>
   <img
     src="https://raw.githubusercontent.com/inache-su/moy-nalog-api/main/assets/readme/hero-en.svg"
     width="100%"
-    alt="moy-nalog-api — typed async and sync Python access to authentication, sessions, and receipt operations for lknpd.nalog.ru"
+    alt="moy-nalog-api by kirodev.eu. Typed Python client for Moy Nalog. Python 3.10+, async and sync, Pydantic v2."
   >
 </p>
 
-<p align="center">
-  <a href="https://pypi.org/project/moy-nalog-api/"><img src="https://img.shields.io/pypi/v/moy-nalog-api?label=PyPI&color=EF5A5A" alt="PyPI version"></a>
-  <a href="https://pypi.org/project/moy-nalog-api/"><img src="https://img.shields.io/pypi/pyversions/moy-nalog-api?color=3776AB" alt="Supported Python versions"></a>
-  <a href="https://github.com/inache-su/moy-nalog-api/blob/main/LICENSE"><img src="https://img.shields.io/github/license/inache-su/moy-nalog-api?color=0D1117" alt="MIT license"></a>
-  <img src="https://img.shields.io/badge/typed-Pydantic%20v2-EF5A5A" alt="Typed with Pydantic v2">
-</p>
-
-<p align="center">
+<p>
   <a href="https://github.com/inache-su/moy-nalog-api/blob/main/README.ru.md">Русская версия</a>
   ·
   <a href="https://pypi.org/project/moy-nalog-api/">PyPI</a>
@@ -21,11 +14,18 @@
   <a href="https://github.com/inache-su/moy-nalog-api/blob/main/CHANGELOG.md">Changelog</a>
   ·
   <a href="https://github.com/inache-su/moy-nalog-api/tree/main/examples">Examples</a>
+  ·
+  <a href="https://github.com/inache-su/moy-nalog-api/blob/main/LICENSE">MIT license</a>
 </p>
 
 `moy-nalog-api` is an unofficial Python client for the Russian self-employed tax service at
 `lknpd.nalog.ru`. It keeps authentication, token refresh, session persistence, transport retries,
 and receipt models behind one typed async API, with a matching synchronous adapter.
+
+[Install](#install) · [First receipt](#create-your-first-receipt) ·
+[Authentication](#authentication) · [Receipts](#receipt-operations) ·
+[Errors](#reliability-and-errors) · [Configuration](#configuration) ·
+[Sync client](#synchronous-client) · [API reference](#public-api-at-a-glance)
 
 > **Unofficial client.** This project is not affiliated with the Federal Tax Service of Russia.
 > The private API can change without notice. Always verify registered and cancelled receipts in the
@@ -77,13 +77,13 @@ asyncio.run(main())
 > verify the result in the personal cabinet, and cancel mistakes explicitly with
 > `cancel_receipt()`.
 
-## What the client handles
+## Capabilities
 
-| Boundary | Concrete behavior |
+| Area | Support |
 | --- | --- |
-| Client shape | `MoyNalogClient` is async-first; `MoyNalogClientSync` delegates to the same implementation |
+| Clients | `MoyNalogClient` is async-first; `MoyNalogClientSync` delegates to the same implementation |
 | Authentication | Password login by INN, or a two-step phone + SMS challenge |
-| Session lifecycle | Optional JSON persistence, proactive refresh, and one refresh-and-replay after a server `401` |
+| Sessions | Optional JSON persistence, proactive refresh, and one refresh-and-replay after a server `401` |
 | Receipts | Single or multiple items, client type, payment type, creation, lookup, download, listing, and cancellation |
 | Transport | Native HTTP/HTTPS proxies, optional SOCKS, configurable timeouts, and bounded network backoff |
 | Failures | Public typed exceptions; validation and API failures are not flattened into transport errors |

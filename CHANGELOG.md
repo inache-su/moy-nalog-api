@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+- Restyled both READMEs with kirodev.eu branding and section navigation
+
 ## [1.1.0] - 2026-09-28
 
 ### Added
